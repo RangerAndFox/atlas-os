@@ -116,7 +116,14 @@ jobs:
             if [ "$code" = "200" ]; then ok=true; break; fi
             sleep 2
           done
-          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          # The harness is a long-running server started in the background, so $? from the
+          # poll loop above is meaningless (it is the last `sleep`). The honest failure
+          # signal is whether the server process is still alive: if the pid is gone, the
+          # harness crashed on startup -> report non-zero so the gate's harnessExitCode
+          # branch fires. `readyOk` is the separate "came up and answered" signal. Both
+          # are fail-closed; neither is a dead input.
+          if kill -0 "$(cat /tmp/harness.pid 2>/dev/null)" 2>/dev/null; then hexit=0; else hexit=1; fi
+          echo "exit=$hexit" >> "$GITHUB_OUTPUT"
           echo "readyOk=$ok" >> "$GITHUB_OUTPUT"
 
       - name: Capture screenshots
