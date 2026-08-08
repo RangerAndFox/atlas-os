@@ -84,6 +84,34 @@
         }
       }
     },
+    "design": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Configures the design-director review. Human-written like the rest of this file — agents cannot write it. A repo with no UI omits this or sets enabled:false; a scoped-out run is a logged skip, NEVER a recorded pass.",
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "harness": { "type": "string", "description": "Command that brings the UI up headless in CI, e.g. 'npm run build && npm run preview -- --port 4173'." },
+        "readyUrl": { "type": "string", "description": "URL polled until it returns 200 before capture, e.g. 'http://localhost:4173'." },
+        "viewports": { "type": "array", "items": { "enum": ["desktop", "mobile"] }, "default": ["desktop", "mobile"] },
+        "screens": {
+          "type": "array",
+          "description": "The screens the director reviews. The human declares what matters; a changed-but-undeclared surface is a finding, not a silent pass.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "path"],
+            "properties": {
+              "name": { "type": "string" },
+              "path": { "type": "string", "description": "Route appended to readyUrl, e.g. '/' or '/story/demo'." }
+            }
+          }
+        },
+        "paths": { "type": "array", "items": { "type": "string" }, "description": "Globs that make a PR user-facing. A PR touching these makes the design check required; a PR touching none is a logged skip." },
+        "functionSignal": { "type": "string", "description": "The repo's own end-to-end command, e.g. 'npm run test:e2e'. Its real exit code is the works-as-intended signal; a failure is a NO-GO on its own." },
+        "browsers": { "type": "string", "description": "Playwright browsers to install/capture with, sourced from playwright.config projects[].use.browserName. Default chromium.", "default": "chromium" }
+      }
+    },
     "activeMission": { "type": ["string", "null"] },
     "gates": {
       "type": "object",
