@@ -71,6 +71,7 @@ jobs:
           # --json-schema forces the verdict into structured_output (see gate step).
           claude_args: |
             --model ${{ vars.ATLAS_REVIEWER_MODEL || 'claude-opus-4-8' }}
+            --allowedTools 'Bash,Read,Grep,Glob'
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["GO","NO-GO"]},"summary":{"type":"string"},"most_important":{"type":"string"},"blast_radius":{"type":"string"},"unverified":{"type":"string"}},"required":["verdict","summary"]}'
           prompt: |
             You are the Atlas independent reviewer running in CI. You did NOT write
