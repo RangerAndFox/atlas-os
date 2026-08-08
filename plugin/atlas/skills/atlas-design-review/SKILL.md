@@ -23,6 +23,20 @@ checkout → install → bring the UI up headless via the repo's declared harnes
 The captured PNGs are the **evidence**. The gate (`plugin/atlas/design/gate.mjs`) refuses a
 GO that produced no screenshots — a design pass that looked at no image looked at nothing.
 
+### Two capture modes
+
+- **Built-in (default).** For a simple, unauthenticated static UI: the workflow runs
+  `harness` (e.g. `build && preview`), polls `readyUrl`, and does an inline chromium
+  `goto`+screenshot of each screen.
+- **`captureCommand` (auth/DB apps).** When the repo sets `design.captureCommand`, the
+  workflow runs *that* instead — a Playwright screenshot spec under the repo's OWN
+  `playwright.config`, which already boots the server, authenticates, provisions a DB, and
+  resolves the browser. This is the honest choice whenever the app is behind auth or needs
+  a database: the built-in `goto` would only screenshot the login/auth wall — fake
+  evidence. The command's exit code becomes the harness signal; the PNG count is the
+  evidence. Both feed the SAME gate — `captureCommand` changes how pixels are produced,
+  never how the merge decision is made.
+
 ## Per-repo config (`.atlas/project.json` → `design`)
 
 Human-written (agents cannot write `project.json`). See the schema for the full shape:
