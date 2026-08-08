@@ -15,7 +15,7 @@
 
 import { buildRolePayload } from "./payloads.mjs";
 import { promotionGate, mergeGate } from "./gates.mjs";
-import { assertNoForbiddenVerbs, SUPERVISOR_TOOLS } from "./authority.mjs";
+import { assertNoForbiddenVerbs, assertExactSurface, EXPECTED_METHODS, SUPERVISOR_TOOLS } from "./authority.mjs";
 
 const DRAFT_ROLES = ["auditor", "mission-control", "mission-author", "criterion-critic"];
 const BUILD_ROLES = ["director", "acceptance-engineer", "implementer"];
@@ -30,8 +30,13 @@ const BUILD_ROLES = ["director", "acceptance-engineer", "implementer"];
  * @returns {Promise<{halt:string, [k:string]:any}>}
  */
 export async function runMission(ctx) {
-  // Refuse to run if any handed-in interface carries a gate-crossing verb. This is AC-6:
-  // capability, checked before we do anything, not intention observed afterwards.
+  // Refuse to run unless each handed-in interface exposes EXACTLY its allowed methods
+  // (the real bound — an unknown method, however named, is rejected), and, as a second
+  // weaker layer, carries no obviously gate-crossing verb. AC-6: capability checked
+  // before we do anything, not intention observed afterwards.
+  assertExactSurface(ctx.roles, EXPECTED_METHODS.roles, "roles");
+  assertExactSurface(ctx.git, EXPECTED_METHODS.git, "git");
+  assertExactSurface(ctx.io, EXPECTED_METHODS.io, "io");
   assertNoForbiddenVerbs(ctx.roles, "roles");
   assertNoForbiddenVerbs(ctx.git, "git");
   assertNoForbiddenVerbs(ctx.io, "io");

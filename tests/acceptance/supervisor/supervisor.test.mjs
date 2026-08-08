@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 
 import { runMission } from "../../../plugin/atlas/supervisor/supervisor.mjs";
 import { buildRolePayload, PLAN_BLIND_ROLES } from "../../../plugin/atlas/supervisor/payloads.mjs";
-import { assertNoForbiddenVerbs, SUPERVISOR_TOOLS, FORBIDDEN_VERBS } from "../../../plugin/atlas/supervisor/authority.mjs";
+import { assertNoForbiddenVerbs, assertExactSurface, EXPECTED_METHODS, SUPERVISOR_TOOLS, FORBIDDEN_VERBS } from "../../../plugin/atlas/supervisor/authority.mjs";
 import { promotionGate, mergeGate } from "../../../plugin/atlas/supervisor/gates.mjs";
 
 const PLAN_MARKER = "PLAN_MARKER_should_never_reach_acceptance_engineer";
@@ -75,7 +75,7 @@ test("AC-2: an io that CAN write live mission state is refused before running", 
   const unsafeIo = { ...f.io, writeLiveMission: async () => {} };
   await assert.rejects(
     () => runMission({ intent: "x", missionId: "m1", roles: f.roles, git: f.git, io: unsafeIo }),
-    /forbidden capability/i,
+    /unexpected method|forbidden capability/i,
   );
 });
 test("AC-2: writing a proposal does NOT make a mission live (proposal is not authority)", async () => {
@@ -134,8 +134,31 @@ test("AC-6: runMission refuses to start if any interface carries a forbidden ver
   const rolesWithPromote = { ...f.roles, promote: async () => {} };
   await assert.rejects(
     () => runMission({ intent: "x", missionId: "m", roles: rolesWithPromote, git: f.git, io: f.io }),
-    /forbidden capability/i,
+    /unexpected method|forbidden capability/i,
   );
+});
+// AC-6 hardening (reviewer caveat): a gate-crossing method with an INNOCENT name
+// (no forbidden substring) must still be refused — the allowlist, not the denylist,
+// is the real bound.
+test("AC-6: an innocent-named extra method is refused by the exact-surface allowlist", () => {
+  // 'finalize' contains no forbidden verb, so the substring check would pass it...
+  assert.doesNotThrow(() => assertNoForbiddenVerbs({ openPR() {}, finalize() {} }, "git"));
+  // ...but the allowlist refuses it outright.
+  assert.throws(
+    () => assertExactSurface({ openPR() {}, finalize() {} }, EXPECTED_METHODS.git, "git"),
+    /unexpected method "finalize"/,
+  );
+});
+test("AC-6: runMission refuses an interface with an innocent-named extra method", async () => {
+  const f = makeFakes({ live: null });
+  const gitWithExtra = { ...f.git, finalize: async () => {} };
+  await assert.rejects(
+    () => runMission({ intent: "x", missionId: "m", roles: f.roles, git: gitWithExtra, io: f.io }),
+    /unexpected method "finalize"/,
+  );
+});
+test("AC-6: an interface missing a required method is refused", () => {
+  assert.throws(() => assertExactSurface({}, EXPECTED_METHODS.git, "git"), /missing required method "openPR"/);
 });
 
 // ---- AC-7 — Session-scoped, no durable authority -------------------------------
