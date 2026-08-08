@@ -22,6 +22,7 @@ Read these and record where each fact came from:
 | Existing CI | `.github/workflows/*` — extend, do not replace |
 | Existing agent guidance | `CLAUDE.md`, `AGENTS.md`, `.claude/` — **append, never clobber.** Quote the current heading list before editing |
 | Repo visibility + remote | `git remote get-url origin`; ask the human for visibility if unsure |
+| Design surface (`design` block) | Does the repo render a UI? If there are client components (`*.tsx`/`*.vue`/`*.svelte`) and a way to serve them, set `design.enabled:true` and source `harness`/`readyUrl` from the repo's `build`+`preview`/`start` scripts, `screens` from its top routes, `paths` from where UI lives (e.g. `src/**/*.tsx`), `functionSignal` from its e2e script (`test:e2e`). No UI → `enabled:false`. **Ask the human which screens matter** — do not guess the screen list. `browsers` reuses `{{BROWSERS}}` (default chromium). |
 
 If a required fact has no source in the repository, stop and ask. Do not default it.
 
@@ -34,6 +35,8 @@ From `templates/`, write into the target repo, filling every `{{TOKEN}}`:
 - `.devcontainer/Dockerfile` + `devcontainer.json` — base on `node:{{NODE_MAJOR}}-bookworm` (Node is the base, not something apt-installed onto another image's Node, which leaves the wrong Node first on PATH), then `playwright install --with-deps {{BROWSERS}}` so browsers derive from the lockfile-resolved set rather than a hand-matched base-image tag. Fill `{{BROWSERS}}` from the detected browser names (Step 1). Pin by digest once built.
 - `.github/workflows/atlas-devimage.yml` — build and push the dev image to GHCR when the lockfile or Dockerfile changes; emit the digest.
 - `.github/workflows/atlas-validate.yml` — run the ladder in the pinned container. **Every rung is required; a skipped rung fails the job.**
+- `.github/workflows/atlas-review.yml` — the independent reviewer. Confirm its `claude_args` carry `--allowedTools 'Bash,Read,Grep,Glob'` (without them the reviewer cannot run the repo's tests) and `--json-schema`.
+- `.github/workflows/atlas-design-review.yml` — **only if `design.enabled:true`.** Renders the UI, screenshots the declared screens with chromium, and has the design-director review the pixels + the e2e run; the gate is `plugin/atlas/design/gate.mjs`. Make it a **required** status check so it has teeth. Follow `skills/atlas-design-review/SKILL.md`.
 - `.github/CODEOWNERS` — the human owns `.atlas/**`, `tests/acceptance/**`, `.github/**`, and manifests.
 - `tests/acceptance/` + README, matching the project's detected test conventions.
 - `.claude/settings.json` — deny rules, `defaultMode: plan`, telemetry on.

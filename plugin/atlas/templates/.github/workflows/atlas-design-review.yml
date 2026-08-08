@@ -1,0 +1,232 @@
+# Atlas design review — render the UI in CI, screenshot it, and have the design-director
+# review the actual pixels plus the repo's own end-to-end run. The verdict becomes a merge
+# decision through plugin/atlas/design/gate.mjs (evaluateDesignGate), which is unit-tested
+# in tests/acceptance/design-director/ — so the logic proven by tests is the logic enforced
+# here. Fail-closed: missing evidence, a dead harness, a failing e2e, or an absent verdict
+# all BLOCK. Config is read from .atlas/project.json's `design` block (human-written).
+#
+# Make this a REQUIRED status check on the default branch to give the review teeth.
+name: atlas-design-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+concurrency:
+  group: atlas-design-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  design-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---- Owner override (mirrors atlas-review) ---------------------------
+      # A NO-GO blocks. Only the owner, verified by the labeling actor, may override
+      # via `atlas-override-design`. The machine account cannot self-clear. Override
+      # bypasses THIS check only; code-owner review on guarded paths still stands.
+      - name: Honor owner override
+        id: override
+        run: |
+          set -euo pipefail
+          present=false; owner=false
+          if ${{ contains(github.event.pull_request.labels.*.name, 'atlas-override-design') }}; then
+            present=true
+            if [ "${{ github.event.sender.login }}" = "${{ vars.ATLAS_OWNER }}" ] \
+               || [ "${{ github.actor }}" = "${{ vars.ATLAS_OWNER }}" ]; then owner=true; fi
+          fi
+          echo "present=$present" >> "$GITHUB_OUTPUT"
+          echo "owner=$owner"     >> "$GITHUB_OUTPUT"
+
+      # ---- Read design config + decide scope -------------------------------
+      - name: Read design config
+        id: cfg
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'EOF' >> "$GITHUB_OUTPUT"
+          import fs from "node:fs";
+          const p = ".atlas/project.json";
+          const cfg = fs.existsSync(p) ? (JSON.parse(fs.readFileSync(p, "utf8")).design ?? {}) : {};
+          const enabled = cfg.enabled === true;
+          const node = (() => { try { return JSON.parse(fs.readFileSync(p,"utf8")).runtime?.node ?? "20"; } catch { return "20"; } })();
+          console.log(`enabled=${enabled}`);
+          console.log(`browsers=${cfg.browsers ?? "chromium"}`);
+          console.log(`harness=${cfg.harness ?? ""}`);
+          console.log(`readyUrl=${cfg.readyUrl ?? ""}`);
+          console.log(`functionSignal=${cfg.functionSignal ?? ""}`);
+          console.log(`node=${String(node).replace(/[^0-9.x]/g,"") || "20"}`);
+          // Emit screens/viewports/paths as compact JSON for later steps.
+          const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64");
+          console.log(`screens_b64=${b64(cfg.screens ?? [])}`);
+          console.log(`viewports_b64=${b64(cfg.viewports ?? ["desktop","mobile"])}`);
+          console.log(`paths_b64=${b64(cfg.paths ?? [])}`);
+          EOF
+
+      - name: Determine if PR is user-facing
+        id: scope
+        run: |
+          set -euo pipefail
+          git fetch origin ${{ github.event.pull_request.base.sha }} --depth=1 || true
+          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }} || true)
+          printf '%s\n' "$CHANGED" > /tmp/changed.txt
+          node --input-type=module <<'EOF' >> "$GITHUB_OUTPUT"
+          import fs from "node:fs";
+          const paths = JSON.parse(Buffer.from(process.env.PATHS_B64 || "W10=", "base64").toString("utf8"));
+          const changed = fs.readFileSync("/tmp/changed.txt","utf8").split("\n").filter(Boolean);
+          const mm = (glob, f) => {
+            const re = new RegExp("^" + glob
+              .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+              .replace(/\*\*/g, "§§").replace(/\*/g, "[^/]*").replace(/§§/g, ".*") + "$");
+            return re.test(f);
+          };
+          const touches = paths.length > 0 && changed.some((f) => paths.some((g) => mm(g, f)));
+          console.log(`userFacing=${touches}`);
+          EOF
+        env:
+          PATHS_B64: ${{ steps.cfg.outputs.paths_b64 }}
+
+      # ---- Everything below only matters when enabled AND user-facing ------
+      - uses: actions/setup-node@v4
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
+        with:
+          node-version: ${{ steps.cfg.outputs.node }}
+
+      - name: Install deps
+        id: install
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
+        run: npm ci || npm install
+
+      - name: Install Playwright browser
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
+        run: npx playwright install --with-deps ${{ steps.cfg.outputs.browsers }}
+
+      - name: Bring the UI up
+        id: harness
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
+        run: |
+          set +e
+          nohup bash -lc "${{ steps.cfg.outputs.harness }}" > /tmp/harness.log 2>&1 &
+          echo $! > /tmp/harness.pid
+          ok=false
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "${{ steps.cfg.outputs.readyUrl }}" || echo 000)
+            if [ "$code" = "200" ]; then ok=true; break; fi
+            sleep 2
+          done
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          echo "readyOk=$ok" >> "$GITHUB_OUTPUT"
+
+      - name: Capture screenshots
+        id: shots
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/design
+          node --input-type=module <<'EOF' >> "$GITHUB_OUTPUT"
+          import { chromium } from "playwright";
+          const screens = JSON.parse(Buffer.from(process.env.SCREENS_B64,"base64").toString("utf8"));
+          const viewports = JSON.parse(Buffer.from(process.env.VIEWPORTS_B64,"base64").toString("utf8"));
+          const sizes = { desktop: { width: 1440, height: 900 }, mobile: { width: 390, height: 844 } };
+          const base = process.env.READY_URL;
+          const declared = screens.length * viewports.length;
+          let n = 0;
+          const browser = await chromium.launch();
+          for (const s of screens) for (const v of viewports) {
+            try {
+              const page = await browser.newPage({ viewport: sizes[v] ?? sizes.desktop });
+              await page.goto(base + s.path, { waitUntil: "networkidle", timeout: 30000 });
+              await page.screenshot({ path: `artifacts/design/${s.name}-${v}.png`, fullPage: true });
+              await page.close(); n++;
+            } catch (e) { console.error(`capture failed: ${s.name}-${v}: ${e.message}`); }
+          }
+          await browser.close();
+          console.log(`captured=${n}`);
+          console.log(`declared=${declared}`);
+          EOF
+        env:
+          SCREENS_B64: ${{ steps.cfg.outputs.screens_b64 }}
+          VIEWPORTS_B64: ${{ steps.cfg.outputs.viewports_b64 }}
+          READY_URL: ${{ steps.cfg.outputs.readyUrl }}
+
+      - name: Upload screenshots (evidence)
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-design-screenshots-${{ github.event.pull_request.number }}
+          path: artifacts/design/
+
+      - name: Run function signal (repo e2e)
+        id: fn
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true' && steps.cfg.outputs.functionSignal != ''
+        run: |
+          set +e
+          bash -lc "${{ steps.cfg.outputs.functionSignal }}"
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+
+      # ---- The design-director reviews the captured pixels -----------------
+      - name: Design-director review
+        id: review
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true' && steps.override.outputs.owner != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --model ${{ vars.ATLAS_REVIEWER_MODEL || 'claude-opus-4-8' }}
+            --allowedTools 'Bash,Read,Grep,Glob'
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["GO","NO-GO"]},"findings":{"type":"array","items":{"type":"object","properties":{"screen":{"type":"string"},"viewport":{"type":"string"},"severity":{"type":"string"},"what":{"type":"string"},"why_it_matters":{"type":"string"}}}},"most_important":{"type":"string"},"unverified":{"type":"string"}},"required":["verdict","most_important"]}'
+          prompt: |
+            You are the Atlas design-director running in CI. You did NOT build this change.
+            Follow plugin/atlas/skills/atlas-design-review/SKILL.md and the role definition
+            plugin/atlas/agents/atlas-design-director.md exactly.
+
+            The captured screenshots for PR #${{ github.event.pull_request.number }} are in
+            ./artifacts/design/ (named <screen>-<viewport>.png). READ each PNG and review the
+            actual pixels — legibility, hierarchy, layout integrity (especially mobile),
+            state honesty, consistency, and obvious accessibility misses.
+
+            The repo's own end-to-end run exited with code ${{ steps.fn.outputs.exit || 'n/a' }}.
+            The UI harness readiness was ${{ steps.harness.outputs.readyOk || 'unknown' }}.
+
+            Hard rules: if a declared screen has no screenshot, do NOT approve it — that is a
+            NO-GO. Do not narrate a screen you cannot see. Return the structured verdict.
+
+      # ---- The gate: tested logic turns the verdict into a decision --------
+      - name: Design gate
+        id: gate
+        if: always() && steps.cfg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'EOF'
+          import { evaluateDesignGate } from "./plugin/atlas/design/gate.mjs";
+          const num = (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d; };
+          const bool = (v) => String(v) === "true";
+          const fnRaw = process.env.FN_EXIT;
+          const g = evaluateDesignGate({
+            designEnabled: bool(process.env.ENABLED),
+            prTouchesDesignPaths: bool(process.env.USER_FACING),
+            harnessExitCode: num(process.env.HARNESS_EXIT, 0),
+            readyOk: bool(process.env.READY_OK),
+            screenshotsCaptured: num(process.env.CAPTURED, 0),
+            declaredScreens: num(process.env.DECLARED, 0),
+            functionSignalExit: (fnRaw === "" || fnRaw === undefined) ? null : num(fnRaw, 1),
+            reviewerVerdict: process.env.VERDICT || null,
+            override: { present: bool(process.env.OVR_PRESENT), actorIsOwner: bool(process.env.OVR_OWNER) },
+          });
+          console.log(`::notice::atlas-design-review ${g.status.toUpperCase()} — ${g.reason}`);
+          if (g.blocks) { console.error(`::error::Design review BLOCKS this PR: ${g.reason}`); process.exit(1); }
+          if (!g.pass) console.log(`::notice::Not a design pass (${g.status}); not recorded as green.`);
+          EOF
+        env:
+          ENABLED: ${{ steps.cfg.outputs.enabled }}
+          USER_FACING: ${{ steps.scope.outputs.userFacing }}
+          HARNESS_EXIT: ${{ steps.harness.outputs.exit }}
+          READY_OK: ${{ steps.harness.outputs.readyOk }}
+          CAPTURED: ${{ steps.shots.outputs.captured }}
+          DECLARED: ${{ steps.shots.outputs.declared }}
+          FN_EXIT: ${{ steps.fn.outputs.exit }}
+          VERDICT: ${{ steps.review.outputs.structured_output && fromJSON(steps.review.outputs.structured_output).verdict }}
+          OVR_PRESENT: ${{ steps.override.outputs.present }}
+          OVR_OWNER: ${{ steps.override.outputs.owner }}
