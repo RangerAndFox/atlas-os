@@ -58,6 +58,14 @@ jobs:
           console.log(`readyUrl=${cfg.readyUrl ?? ""}`);
           console.log(`functionSignal=${cfg.functionSignal ?? ""}`);
           console.log(`node=${String(node).replace(/[^0-9.x]/g,"") || "20"}`);
+          // Capture mode: if the repo supplies a captureCommand it drives capture through
+          // its OWN Playwright harness (server boot, auth, DB, browser resolution already
+          // solved there) — the honest choice for apps behind auth or needing a database.
+          // Otherwise fall back to the built-in generic build+serve+goto capture.
+          const captureCommand = cfg.captureCommand ?? "";
+          console.log(`captureCommand=${captureCommand}`);
+          console.log(`captureMode=${captureCommand ? "command" : "inline"}`);
+          console.log(`declared=${(cfg.screens ?? []).length * (cfg.viewports ?? ["desktop","mobile"]).length}`);
           // Emit screens/viewports/paths as compact JSON for later steps.
           const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64");
           console.log(`screens_b64=${b64(cfg.screens ?? [])}`);
@@ -103,9 +111,29 @@ jobs:
         if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
         run: npx playwright install --with-deps ${{ steps.cfg.outputs.browsers }}
 
+      # ---- Capture, mode A: the repo's own harness (auth/DB apps) ----------
+      # The repo command boots its own server (via its playwright.config webServer or
+      # equivalent), authenticates, and writes one PNG per declared screen×viewport to
+      # artifacts/design/. Its exit code is the honest harness signal; the PNG count is
+      # the evidence. Both feed the same gate as the inline path.
+      - name: Capture via repo command
+        id: cap
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true' && steps.cfg.outputs.captureMode == 'command'
+        run: |
+          set +e
+          mkdir -p artifacts/design
+          bash -lc "${{ steps.cfg.outputs.captureCommand }}"
+          code=$?
+          n=$(find artifacts/design -type f -name '*.png' | wc -l | tr -d ' ')
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = "0" ]; then echo "readyOk=true" >> "$GITHUB_OUTPUT"; else echo "readyOk=false" >> "$GITHUB_OUTPUT"; fi
+          echo "captured=$n" >> "$GITHUB_OUTPUT"
+          echo "declared=${{ steps.cfg.outputs.declared }}" >> "$GITHUB_OUTPUT"
+
+      # ---- Capture, mode B: built-in generic capture (simple static UIs) ---
       - name: Bring the UI up
         id: harness
-        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true' && steps.cfg.outputs.captureMode == 'inline'
         run: |
           set +e
           nohup bash -lc "${{ steps.cfg.outputs.harness }}" > /tmp/harness.log 2>&1 &
@@ -128,7 +156,7 @@ jobs:
 
       - name: Capture screenshots
         id: shots
-        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true' && steps.cfg.outputs.captureMode == 'inline'
         run: |
           set -euo pipefail
           mkdir -p artifacts/design
@@ -195,7 +223,7 @@ jobs:
             state honesty, consistency, and obvious accessibility misses.
 
             The repo's own end-to-end run exited with code ${{ steps.fn.outputs.exit || 'n/a' }}.
-            The UI harness readiness was ${{ steps.harness.outputs.readyOk || 'unknown' }}.
+            The UI harness readiness was ${{ steps.harness.outputs.readyOk || steps.cap.outputs.readyOk || 'unknown' }}.
 
             Hard rules: if a declared screen has no screenshot, do NOT approve it — that is a
             NO-GO. Do not narrate a screen you cannot see. Return the structured verdict.
@@ -229,10 +257,13 @@ jobs:
         env:
           ENABLED: ${{ steps.cfg.outputs.enabled }}
           USER_FACING: ${{ steps.scope.outputs.userFacing }}
-          HARNESS_EXIT: ${{ steps.harness.outputs.exit }}
-          READY_OK: ${{ steps.harness.outputs.readyOk }}
-          CAPTURED: ${{ steps.shots.outputs.captured }}
-          DECLARED: ${{ steps.shots.outputs.declared }}
+          # Whichever capture mode ran wrote these; the other step was skipped and its
+          # outputs are empty. GitHub treats "0"/"false" as non-empty (truthy) strings, so
+          # `||` preserves the real value from the step that actually ran.
+          HARNESS_EXIT: ${{ steps.harness.outputs.exit || steps.cap.outputs.exit }}
+          READY_OK: ${{ steps.harness.outputs.readyOk || steps.cap.outputs.readyOk }}
+          CAPTURED: ${{ steps.shots.outputs.captured || steps.cap.outputs.captured }}
+          DECLARED: ${{ steps.shots.outputs.declared || steps.cap.outputs.declared }}
           FN_EXIT: ${{ steps.fn.outputs.exit }}
           VERDICT: ${{ steps.review.outputs.structured_output && fromJSON(steps.review.outputs.structured_output).verdict }}
           OVR_PRESENT: ${{ steps.override.outputs.present }}

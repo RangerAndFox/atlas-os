@@ -109,6 +109,7 @@
         },
         "paths": { "type": "array", "items": { "type": "string" }, "description": "Globs that make a PR user-facing. A PR touching these makes the design check required; a PR touching none is a logged skip." },
         "functionSignal": { "type": "string", "description": "The repo's own end-to-end command, e.g. 'npm run test:e2e'. Its real exit code is the works-as-intended signal; a failure is a NO-GO on its own." },
+        "captureCommand": { "type": "string", "description": "Optional. A single-line repo command that renders the declared screens and writes one PNG per screen×viewport to artifacts/design/ — typically a Playwright screenshot spec run under the repo's OWN playwright.config, which already boots the server, authenticates, provisions a DB, and resolves the browser. Set this for apps behind auth or needing a database (the built-in harness+readyUrl+goto path would only screenshot the auth wall). When set, harness/readyUrl are ignored and the command's exit code is the harness signal. When omitted, the built-in generic capture is used." },
         "browsers": { "type": "string", "description": "Playwright browsers to install/capture with, sourced from playwright.config projects[].use.browserName. Default chromium.", "default": "chromium" }
       }
     },
