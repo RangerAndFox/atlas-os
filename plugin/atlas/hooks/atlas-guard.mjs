@@ -265,21 +265,26 @@ function gitPushDecision(cmd, context) {
       if (sub) return sub;
     }
   }
+  // Strip backslashes from every token before analysis: the shell removes an unquoted
+  // `\` before git ever sees it, so `ma\in` is `main`, `--fo\rce` is `--force`, `-\d` is
+  // `-d`. Checking the un-normalised token (as an earlier version did for the markers,
+  // though not the binary) let a single backslash defeat every dangerous-push rule.
+  const ntoks = toks.map((t) => t.replace(/\\/g, ""));
   // Analyse every `git … push` occurrence in every ;/&/| separated segment.
   let i = 0;
-  while (i < toks.length) {
-    if (!isGitBinary(toks[i])) { i += 1; continue; }
+  while (i < ntoks.length) {
+    if (!isGitBinary(ntoks[i])) { i += 1; continue; }
     // find `push` within this command segment
     let pi = -1;
-    for (let j = i + 1; j < toks.length; j += 1) {
-      const t = toks[j];
+    for (let j = i + 1; j < ntoks.length; j += 1) {
+      const t = ntoks[j];
       if (t === ";" || t === "&" || t === "|" || t === "(" || t === ")") break;
       if (t === "push") { pi = j; break; }
     }
     if (pi === -1) { i += 1; continue; }
     const positionals = [];
-    for (let j = pi + 1; j < toks.length; j += 1) {
-      const t = toks[j];
+    for (let j = pi + 1; j < ntoks.length; j += 1) {
+      const t = ntoks[j];
       if (t === ";" || t === "&" || t === "|" || t === "(" || t === ")") break; // only this command
       if (/^--force(-with-lease|-if-includes)?(=.*)?$/.test(t) || /^-[A-Za-z]*f[A-Za-z]*$/.test(t)) return deny("Force-push overwrites published history and requires a human.");
       if (/^(--delete|--mirror|--prune)$/.test(t) || /^-[A-Za-z]*[dD][A-Za-z]*$/.test(t)) return deny("Deleting or pruning a remote ref requires a human.");
@@ -617,7 +622,10 @@ try {
     // (`git reb"ase"`) or binary (`g"it" push`) reads as its real word here. Over-denial
     // (a rule word appearing in quoted prose) is the safe direction for this list.
     const rejoin = (s) => tokenizeShell(s).join(" ");
-    const variants = [cmd, cmdResolved, stripQuoted(cmd), stripQuoted(cmdResolved), rejoin(cmd), rejoin(cmdResolved)];
+    // deBackslash: the shell drops an unquoted `\`, so `--am\end` runs as `--amend`.
+    // Include a backslash-stripped variant so that trick can't slip any rule below.
+    const deBackslash = (s) => String(s).replace(/\\/g, "");
+    const variants = [cmd, cmdResolved, stripQuoted(cmd), stripQuoted(cmdResolved), rejoin(cmd), rejoin(cmdResolved), deBackslash(cmd), deBackslash(rejoin(cmd))];
     for (const { re, why } of FORBIDDEN_COMMANDS) {
       if (variants.some((v) => re.test(v))) {
         return decide("deny", "forbidden-effect", `${why}\nCommand: ${cmd.slice(0, 400)}`, context);
