@@ -98,11 +98,72 @@ check 2 atlas-implementer "git config cannot relocate hooks"         '{"tool_nam
 echo
 echo "EVASIONS — the anchor used to require the verb adjacent to the binary"
 check 2 atlas-implementer "git -C . push"                            '{"tool_name":"Bash","tool_input":{"command":"git -C . push origin main"}}'
-check 2 atlas-implementer "git -c k=v push"                          '{"tool_name":"Bash","tool_input":{"command":"git -c a=b push"}}'
-check 2 atlas-implementer "git --no-pager push"                      '{"tool_name":"Bash","tool_input":{"command":"git --no-pager push"}}'
-check 2 atlas-implementer "verb from a variable"                     '{"tool_name":"Bash","tool_input":{"command":"P=push; git $P"}}'
+check 0 atlas-implementer "safe feature push via -c is ALLOWED"      '{"tool_name":"Bash","tool_input":{"command":"git -c a=b push -u origin feature"}}'
+check 2 atlas-implementer "force behind --no-pager still denied"     '{"tool_name":"Bash","tool_input":{"command":"git --no-pager push --force origin x"}}'
+check 2 atlas-implementer "push to main via a variable"              '{"tool_name":"Bash","tool_input":{"command":"P=push; git $P origin main"}}'
 check 2 atlas-implementer "gh api --method POST"                     '{"tool_name":"Bash","tool_input":{"command":"gh api --method POST /repos/x/y/merges"}}'
 check 2 atlas-implementer "eval hides the command"                   '{"tool_name":"Bash","tool_input":{"command":"eval \"git push\""}}'
+
+echo
+echo "PUSH POLICY (Option A) — safe feature pushes allowed, dangerous denied, evasion-resistant"
+check 0 atlas-implementer "plain feature push allowed"               '{"tool_name":"Bash","tool_input":{"command":"git push -u origin feature/x"}}'
+check 0 atlas-implementer "HEAD:feature push allowed"                '{"tool_name":"Bash","tool_input":{"command":"git push origin HEAD:feature"}}'
+check 2 atlas-implementer "force push denied (--force)"              '{"tool_name":"Bash","tool_input":{"command":"git push --force origin feature"}}'
+check 2 atlas-implementer "force push denied (--force-with-lease)"   '{"tool_name":"Bash","tool_input":{"command":"git push --force-with-lease origin feature"}}'
+check 2 atlas-implementer "force push denied (-f)"                   '{"tool_name":"Bash","tool_input":{"command":"git push -f origin feature"}}'
+check 2 atlas-implementer "force push denied (+refspec)"             '{"tool_name":"Bash","tool_input":{"command":"git push origin +feature"}}'
+check 2 atlas-implementer "remote ref delete denied (--delete)"      '{"tool_name":"Bash","tool_input":{"command":"git push origin --delete feature"}}'
+check 2 atlas-implementer "remote ref delete denied (:refspec)"      '{"tool_name":"Bash","tool_input":{"command":"git push origin :feature"}}'
+check 2 atlas-implementer "remote ref delete denied (-d shorthand)"  '{"tool_name":"Bash","tool_input":{"command":"git push -d origin feature"}}'
+check 2 atlas-implementer "remote ref delete denied (-D shorthand)"  '{"tool_name":"Bash","tool_input":{"command":"git push -D origin feature"}}'
+check 2 atlas-implementer "mirror push denied (prunes remote refs)"  '{"tool_name":"Bash","tool_input":{"command":"git push --mirror origin"}}'
+check 2 atlas-implementer "prune push denied"                        '{"tool_name":"Bash","tool_input":{"command":"git push --prune origin"}}'
+check 2 atlas-implementer "EVASION: -d delete hidden by quoted -c"   '{"tool_name":"Bash","tool_input":{"command":"git -c a='"'"'b c'"'"' push -d origin feature"}}'
+check 0 atlas-implementer "safe push with -u is still allowed"       '{"tool_name":"Bash","tool_input":{"command":"git push -u origin feature"}}'
+check 2 atlas-implementer "direct push to main denied"               '{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}'
+check 2 atlas-implementer "push to main via HEAD:main denied"        '{"tool_name":"Bash","tool_input":{"command":"git push origin HEAD:main"}}'
+check 2 atlas-implementer "EVASION: force hidden by quoted -c"       '{"tool_name":"Bash","tool_input":{"command":"git -c credential.helper='"'"'!gh auth git-credential'"'"' push --force origin x"}}'
+check 2 atlas-implementer "EVASION: delete hidden by quoted -c"      '{"tool_name":"Bash","tool_input":{"command":"git -c a='"'"'b c'"'"' push origin :feature"}}'
+check 2 atlas-implementer "EVASION: force via QUOTED +refspec"       '{"tool_name":"Bash","tool_input":{"command":"git push origin '"'"'+feature'"'"'"}}'
+check 2 atlas-implementer "EVASION: delete via QUOTED :refspec"      '{"tool_name":"Bash","tool_input":{"command":"git push origin '"'"':feature'"'"'"}}'
+check 2 atlas-implementer "EVASION: force via double-quoted +ref"    '{"tool_name":"Bash","tool_input":{"command":"git push origin \"+feature\""}}'
+check 2 atlas-implementer "bare push denied (could reach main)"      '{"tool_name":"Bash","tool_input":{"command":"git push"}}'
+check 2 atlas-implementer "remote-only push denied (no refspec)"     '{"tool_name":"Bash","tool_input":{"command":"git push origin"}}'
+check 0 atlas-implementer "branch NAMED with main is allowed"        '{"tool_name":"Bash","tool_input":{"command":"git push origin feature/main-fix"}}'
+check 2 atlas-implementer "EVASION: quote-split verb to main"        '{"tool_name":"Bash","tool_input":{"command":"git p\"ush\" origin main"}}'
+check 2 atlas-implementer "EVASION: quote-split verb force"          '{"tool_name":"Bash","tool_input":{"command":"git p\"ush\" --force origin feature"}}'
+check 2 atlas-implementer "EVASION: quote-split verb delete"         '{"tool_name":"Bash","tool_input":{"command":"git p\"ush\" -d origin feature"}}'
+check 2 atlas-implementer "EVASION: quote-split binary g\"it\""      '{"tool_name":"Bash","tool_input":{"command":"g\"it\" push origin main"}}'
+check 2 atlas-implementer "EVASION: push to main inside sh -c"       '{"tool_name":"Bash","tool_input":{"command":"sh -c \"git push origin main\""}}'
+check 2 atlas-implementer "EVASION: force push inside bash -lc"      '{"tool_name":"Bash","tool_input":{"command":"bash -lc '"'"'git push --force origin x'"'"'"}}'
+check 2 atlas-implementer "EVASION: quote-split rebase"              '{"tool_name":"Bash","tool_input":{"command":"git reb\"ase\" main"}}'
+check 0 atlas-implementer "quote-split SAFE push is still allowed"   '{"tool_name":"Bash","tool_input":{"command":"git p\"ush\" -u origin feature"}}'
+check 2 atlas-implementer "EVASION: backslash-in-word ma\\in"       '{"tool_name":"Bash","tool_input":{"command":"git push origin ma\\in"}}'
+check 2 atlas-implementer "EVASION: backslash-in-word --fo\\rce"    '{"tool_name":"Bash","tool_input":{"command":"git push --fo\\rce origin x"}}'
+check 2 atlas-implementer "EVASION: backslash-in-word -\\d delete"  '{"tool_name":"Bash","tool_input":{"command":"git push -\\d origin feature"}}'
+check 2 atlas-implementer "EVASION: backslash mas\\ter"            '{"tool_name":"Bash","tool_input":{"command":"git push origin mas\\ter"}}'
+check 2 atlas-implementer "EVASION: backslash in history --am\\end" '{"tool_name":"Bash","tool_input":{"command":"git com\\mit --am\\end"}}'
+check 0 atlas-implementer "backslash in a SAFE feature push allowed" '{"tool_name":"Bash","tool_input":{"command":"git push origin fea\\ture"}}'
+check 2 atlas-implementer "EVASION: full-path /usr/bin/git to main" '{"tool_name":"Bash","tool_input":{"command":"/usr/bin/git push origin main"}}'
+check 2 atlas-implementer "EVASION: backslash \\git force"          '{"tool_name":"Bash","tool_input":{"command":"\\git push --force origin x"}}'
+check 2 atlas-implementer "EVASION: mid-word backslash g\\it delete" '{"tool_name":"Bash","tool_input":{"command":"g\\it push -d origin feature"}}'
+check 2 atlas-implementer "EVASION: subshell (git ... main)"        '{"tool_name":"Bash","tool_input":{"command":"(git push origin main)"}}'
+check 2 atlas-implementer "EVASION: ./git relative path to main"    '{"tool_name":"Bash","tool_input":{"command":"./git push origin main"}}'
+check 0 atlas-implementer "full-path SAFE feature push allowed"     '{"tool_name":"Bash","tool_input":{"command":"/usr/bin/git push -u origin feature"}}'
+check 2 atlas-implementer "push origin HEAD denied (checkout pronoun)" '{"tool_name":"Bash","tool_input":{"command":"git push origin HEAD"}}'
+check 2 atlas-implementer "push origin @ denied (HEAD synonym)"      '{"tool_name":"Bash","tool_input":{"command":"git push origin @"}}'
+check 2 atlas-implementer "push origin @{u} denied"                  '{"tool_name":"Bash","tool_input":{"command":"git push origin @{u}"}}'
+check 2 atlas-implementer "push origin HEAD~1 denied"                '{"tool_name":"Bash","tool_input":{"command":"git push origin HEAD~1"}}'
+check 2 atlas-implementer "force-with-lease with =ref denied"        '{"tool_name":"Bash","tool_input":{"command":"git push --force-with-lease=origin/x origin feature"}}'
+check 2 atlas-implementer "push to refs/heads/main denied"           '{"tool_name":"Bash","tool_input":{"command":"git push origin refs/heads/main"}}'
+check 2 atlas-implementer "push local:main denied"                   '{"tool_name":"Bash","tool_input":{"command":"git push origin feature:main"}}'
+
+echo
+echo "HARNESS SCRATCH (Option B) — plan/todo files outside the repo, narrowly allowed"
+check 0 atlas-implementer "write ~/.claude/plans is allowed"         "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$HOME/.claude/plans/atlas-x.md\"}}"
+check 0 atlas-implementer "write ~/.claude/todos is allowed"         "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$HOME/.claude/todos/t.json\"}}"
+check 2 atlas-implementer "write ~/.claude/settings.json still DENIED" "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$HOME/.claude/settings.json\"}}"
+check 2 atlas-implementer "other ~/.claude path still denied"        "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$HOME/.claude/other.txt\"}}"
 
 echo
 echo "EVASIONS, round 2 — found by the independent reviewer, closed here"

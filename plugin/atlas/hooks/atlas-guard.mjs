@@ -189,6 +189,124 @@ function relativize(target) {
   return rel.split(path.sep).join("/");
 }
 
+// The harness's own ephemeral scratch (plan-mode + todo files) lives under ~/.claude/
+// outside the repo. Allow ONLY those two directories — never the rest of ~/.claude/,
+// which holds settings.json; writing there would let a session widen its own
+// permissions, the one escalation this must never permit.
+function isHarnessScratch(target) {
+  try {
+    const home = process.env.HOME || "";
+    if (!home || !target) return false;
+    const abs = path.resolve(target.startsWith("~/") ? path.join(home, target.slice(2)) : target);
+    const bases = [path.join(home, ".claude", "plans"), path.join(home, ".claude", "todos")];
+    return bases.some((b) => abs === b || abs.startsWith(b + path.sep));
+  } catch {
+    return false;
+  }
+}
+
+// Quote-aware shell tokeniser: strips surrounding quotes, keeps a quoted value with
+// spaces as ONE token, and emits ; & | as their own tokens so a second command can't
+// merge into the first. Not a full shell parser — enough to inspect a git push safely.
+function tokenizeShell(s) {
+  const toks = [];
+  let cur = "";
+  let has = false;
+  let q = null;
+  for (const ch of String(s)) {
+    if (q) {
+      if (ch === q) q = null;
+      else { cur += ch; }
+      has = true;
+    } else if (ch === "'" || ch === '"') {
+      q = ch;
+      has = true;
+    } else if (/\s/.test(ch)) {
+      if (has) { toks.push(cur); cur = ""; has = false; }
+    } else if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === ")") {
+      if (has) { toks.push(cur); cur = ""; has = false; }
+      toks.push(ch);
+    } else {
+      cur += ch;
+      has = true;
+    }
+  }
+  if (has) toks.push(cur);
+  return toks;
+}
+
+// Push policy (Option A), enforced by DENY-BY-DEFAULT on the parsed tokens rather than a
+// leaky regex. A feature-branch push is allowed; force, remote-delete/prune, direct
+// main/master, and a bare/underspecified push (which could reach a protected branch
+// from the current checkout) all require a human. Quotes are stripped by the tokeniser,
+// so '+feature' / ':feature' cannot hide the marker. Returns a deny decision, or null to
+// fall through (allow) when the push is an explicit, clearly-safe feature push.
+// True if a token invokes the git binary however it is spelled: `git`, `/usr/bin/git`,
+// `./git`, `\git`, `(git`, `g\it`, `"git"`. Backslashes (shell escapes that vanish at
+// runtime) and wrapping punctuation/quotes are removed, then the path basename is taken.
+// Matching the exact token "git" — the previous approach — let every one of these through.
+function isGitBinary(tok) {
+  const t = String(tok).replace(/\\/g, "").replace(/^[('"{]+/, "").replace(/[)'"}]+$/, "");
+  return t.split("/").pop() === "git";
+}
+
+function gitPushDecision(cmd, context) {
+  // TOKENIZE FIRST, decide on tokens only. An earlier version regex-gated this on the
+  // raw string (`\bpush\b`), so a quote-split verb — `git p"ush"` — never reached the
+  // tokenizer at all. The tokenizer strips quotes, so on tokens `p"ush"` IS `push` and
+  // `g"it"` IS `git`; no raw-string check may stand in front of it.
+  const toks = tokenizeShell(cmd);
+  const deny = (why) => decide("deny", "forbidden-effect", `${why}\nCommand: ${String(cmd).slice(0, 400)}`, context);
+  // A quoted token carrying whitespace may be a whole sub-command (`sh -c "git push …"`).
+  // Recurse into it so wrapping the push in an interpreter string cannot hide it.
+  for (const t of toks) {
+    if (/\s/.test(t)) {
+      const sub = gitPushDecision(t, context);
+      if (sub) return sub;
+    }
+  }
+  // Strip backslashes from every token before analysis: the shell removes an unquoted
+  // `\` before git ever sees it, so `ma\in` is `main`, `--fo\rce` is `--force`, `-\d` is
+  // `-d`. Checking the un-normalised token (as an earlier version did for the markers,
+  // though not the binary) let a single backslash defeat every dangerous-push rule.
+  const ntoks = toks.map((t) => t.replace(/\\/g, ""));
+  // Analyse every `git … push` occurrence in every ;/&/| separated segment.
+  let i = 0;
+  while (i < ntoks.length) {
+    if (!isGitBinary(ntoks[i])) { i += 1; continue; }
+    // find `push` within this command segment
+    let pi = -1;
+    for (let j = i + 1; j < ntoks.length; j += 1) {
+      const t = ntoks[j];
+      if (t === ";" || t === "&" || t === "|" || t === "(" || t === ")") break;
+      if (t === "push") { pi = j; break; }
+    }
+    if (pi === -1) { i += 1; continue; }
+    const positionals = [];
+    for (let j = pi + 1; j < ntoks.length; j += 1) {
+      const t = ntoks[j];
+      if (t === ";" || t === "&" || t === "|" || t === "(" || t === ")") break; // only this command
+      if (/^--force(-with-lease|-if-includes)?(=.*)?$/.test(t) || /^-[A-Za-z]*f[A-Za-z]*$/.test(t)) return deny("Force-push overwrites published history and requires a human.");
+      if (/^(--delete|--mirror|--prune)$/.test(t) || /^-[A-Za-z]*[dD][A-Za-z]*$/.test(t)) return deny("Deleting or pruning a remote ref requires a human.");
+      if (t.startsWith("+")) return deny("Force-push (via +refspec) requires a human.");
+      if (t.startsWith(":")) return deny("Deleting a remote ref (via :refspec) requires a human.");
+      if (/(?:^|:)(?:refs\/heads\/)?(?:main|master)$/.test(t)) return deny("Pushing directly to main/master requires a human — open a PR.");
+      // HEAD/@ are pronouns for "whatever is checked out" — possibly main. Without an
+      // explicit :destination they are an unnamed push and are refused. HEAD:feature
+      // names its destination and passes (a :main destination is already denied above).
+      if (!t.includes(":") && (t === "HEAD" || /^HEAD[~^@]/.test(t) || t === "@" || t.startsWith("@{"))) {
+        return deny("Pushing HEAD/@ pushes whatever branch is checked out — possibly main. Name the branch explicitly: `git push origin <branch>`.");
+      }
+      if (!t.startsWith("-")) positionals.push(t);
+    }
+    // Require an explicit remote AND refspec. A bare `git push` (or remote-only) could
+    // push the current branch — possibly main — with no branch named, so it is refused.
+    if (positionals.length < 2) return deny("Name an explicit remote and feature branch: `git push origin <branch>`. A bare push could reach a protected branch.");
+    i = pi + 1;
+  }
+  return null;
+}
+
 function decide(verdict, rule, detail, context) {
   try {
     mkdirSync(path.join(ATLAS_DIR, "evidence"), { recursive: true });
@@ -316,7 +434,17 @@ const DEFAULT_SECRETS = [
 // Effects that must never be reachable from an agent, in any mission.
 // Publication, history mutation, infrastructure and destructive commands.
 const FORBIDDEN_COMMANDS = [
-  { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*push\b/, why: "Publication requires a human. Push is the release boundary." },
+  // Push is ALLOWED for feature branches — the machine account opens agent PRs, and
+  // the independent reviewer + branch ruleset are the real merge gates. Only the
+  // dangerous forms stay human-only. The broad `git … push … <marker>` shape means a
+  // quoted global option carrying spaces (e.g. `git -c x='a b' push --force`) cannot
+  // hide the marker — the evasion that slipped the old blanket rule. Over-denial (a
+  // marker word appearing elsewhere on the line) is the safe direction.
+  // NOTE: `git push` is NOT matched here. Regex blocklists kept leaking — a quoted
+  // refspec ('+feature' / ':feature') put the marker behind a quote, and no regex could
+  // require an explicit refspec (a bare `git push` from a main checkout reaches main).
+  // Push is handled by gitPushDecision() below: a quote-aware tokeniser that DENIES by
+  // default and allows only an explicit, non-force, non-delete, non-main feature refspec.
   { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(commit\s+--amend|rebase|reset\s+--hard|filter-branch|filter-repo)\b/, why: "History mutation requires a human." },
   { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(tag|switch|checkout)\s+.*(-d|-D|--delete)\b/, why: "Ref deletion requires a human." },
   { re: /\bgh\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(pr\s+(merge|review)|release|workflow\s+run|api\b.*(-X|--method)\s*(POST|PUT|PATCH|DELETE))/, why: "Merging, approving, releasing and write-API calls are human authority." },
@@ -480,8 +608,26 @@ try {
     // through it. Check both the literal command and this one-hop resolution so
     // the existing regexes see the effective command, not just the written one.
     const cmdResolved = resolveSimpleVarIndirection(cmd);
+    // Push is analysed by a quote-aware tokeniser (deny-by-default), not the regex list.
+    for (const c of [cmd, cmdResolved]) {
+      const pv = gitPushDecision(c, context);
+      if (pv) return pv;
+    }
+    // Neutralise quoted argument VALUES (keeping empty quotes as a token boundary) so a
+    // global option carrying spaces — e.g. `git -c x='a b' push` — cannot push the
+    // forbidden verb out of reach of the flag-skipping regexes. Detection only; this
+    // never grants anything, it only makes the existing denials harder to evade.
+    const stripQuoted = (s) => s.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
+    // Tokens-rejoined variant: tokenization strips quotes, so a quote-split verb
+    // (`git reb"ase"`) or binary (`g"it" push`) reads as its real word here. Over-denial
+    // (a rule word appearing in quoted prose) is the safe direction for this list.
+    const rejoin = (s) => tokenizeShell(s).join(" ");
+    // deBackslash: the shell drops an unquoted `\`, so `--am\end` runs as `--amend`.
+    // Include a backslash-stripped variant so that trick can't slip any rule below.
+    const deBackslash = (s) => String(s).replace(/\\/g, "");
+    const variants = [cmd, cmdResolved, stripQuoted(cmd), stripQuoted(cmdResolved), rejoin(cmd), rejoin(cmdResolved), deBackslash(cmd), deBackslash(rejoin(cmd))];
     for (const { re, why } of FORBIDDEN_COMMANDS) {
-      if (re.test(cmd) || re.test(cmdResolved)) {
+      if (variants.some((v) => re.test(v))) {
         return decide("deny", "forbidden-effect", `${why}\nCommand: ${cmd.slice(0, 400)}`, context);
       }
     }
@@ -557,6 +703,12 @@ try {
 
   const rel = relativize(rawTarget);
   if (rel === null) {
+    // Plan-mode/todo scratch under ~/.claude/plans|todos is the harness's own bookkeeping,
+    // not repo content — allow it so plan mode works in an Atlas repo. Everything else
+    // outside the repository (including the rest of ~/.claude/) stays denied.
+    if (isHarnessScratch(rawTarget)) {
+      return decide("allow", "harness-scratch", rawTarget, context);
+    }
     return decide("deny", "outside-repository", `Path resolves outside the repository: ${rawTarget}`, context);
   }
 
