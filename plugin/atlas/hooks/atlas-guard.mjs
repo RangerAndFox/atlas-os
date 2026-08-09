@@ -189,6 +189,22 @@ function relativize(target) {
   return rel.split(path.sep).join("/");
 }
 
+// The harness's own ephemeral scratch (plan-mode + todo files) lives under ~/.claude/
+// outside the repo. Allow ONLY those two directories — never the rest of ~/.claude/,
+// which holds settings.json; writing there would let a session widen its own
+// permissions, the one escalation this must never permit.
+function isHarnessScratch(target) {
+  try {
+    const home = process.env.HOME || "";
+    if (!home || !target) return false;
+    const abs = path.resolve(target.startsWith("~/") ? path.join(home, target.slice(2)) : target);
+    const bases = [path.join(home, ".claude", "plans"), path.join(home, ".claude", "todos")];
+    return bases.some((b) => abs === b || abs.startsWith(b + path.sep));
+  } catch {
+    return false;
+  }
+}
+
 function decide(verdict, rule, detail, context) {
   try {
     mkdirSync(path.join(ATLAS_DIR, "evidence"), { recursive: true });
@@ -316,7 +332,15 @@ const DEFAULT_SECRETS = [
 // Effects that must never be reachable from an agent, in any mission.
 // Publication, history mutation, infrastructure and destructive commands.
 const FORBIDDEN_COMMANDS = [
-  { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*push\b/, why: "Publication requires a human. Push is the release boundary." },
+  // Push is ALLOWED for feature branches — the machine account opens agent PRs, and
+  // the independent reviewer + branch ruleset are the real merge gates. Only the
+  // dangerous forms stay human-only. The broad `git … push … <marker>` shape means a
+  // quoted global option carrying spaces (e.g. `git -c x='a b' push --force`) cannot
+  // hide the marker — the evasion that slipped the old blanket rule. Over-denial (a
+  // marker word appearing elsewhere on the line) is the safe direction.
+  { re: /\bgit\b[^\n]*\bpush\b[^\n]*(?:--force\b|--force-with-lease\b|(?:^|\s)-[A-Za-z]*f[A-Za-z]*\b|(?:^|\s)\+)/, why: "Force-push overwrites published history and requires a human." },
+  { re: /\bgit\b[^\n]*\bpush\b[^\n]*(?:--delete\b|(?:^|\s):[^\s]+)/, why: "Deleting a remote ref requires a human." },
+  { re: /\bgit\b[^\n]*\bpush\b[^\n]*\b(?:main|master)\b/, why: "Pushing directly to main/master requires a human — open a PR." },
   { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(commit\s+--amend|rebase|reset\s+--hard|filter-branch|filter-repo)\b/, why: "History mutation requires a human." },
   { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(tag|switch|checkout)\s+.*(-d|-D|--delete)\b/, why: "Ref deletion requires a human." },
   { re: /\bgh\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(pr\s+(merge|review)|release|workflow\s+run|api\b.*(-X|--method)\s*(POST|PUT|PATCH|DELETE))/, why: "Merging, approving, releasing and write-API calls are human authority." },
@@ -480,8 +504,14 @@ try {
     // through it. Check both the literal command and this one-hop resolution so
     // the existing regexes see the effective command, not just the written one.
     const cmdResolved = resolveSimpleVarIndirection(cmd);
+    // Neutralise quoted argument VALUES (keeping empty quotes as a token boundary) so a
+    // global option carrying spaces — e.g. `git -c x='a b' push` — cannot push the
+    // forbidden verb out of reach of the flag-skipping regexes. Detection only; this
+    // never grants anything, it only makes the existing denials harder to evade.
+    const stripQuoted = (s) => s.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
+    const variants = [cmd, cmdResolved, stripQuoted(cmd), stripQuoted(cmdResolved)];
     for (const { re, why } of FORBIDDEN_COMMANDS) {
-      if (re.test(cmd) || re.test(cmdResolved)) {
+      if (variants.some((v) => re.test(v))) {
         return decide("deny", "forbidden-effect", `${why}\nCommand: ${cmd.slice(0, 400)}`, context);
       }
     }
@@ -557,6 +587,12 @@ try {
 
   const rel = relativize(rawTarget);
   if (rel === null) {
+    // Plan-mode/todo scratch under ~/.claude/plans|todos is the harness's own bookkeeping,
+    // not repo content — allow it so plan mode works in an Atlas repo. Everything else
+    // outside the repository (including the rest of ~/.claude/) stays denied.
+    if (isHarnessScratch(rawTarget)) {
+      return decide("allow", "harness-scratch", rawTarget, context);
+    }
     return decide("deny", "outside-repository", `Path resolves outside the repository: ${rawTarget}`, context);
   }
 
