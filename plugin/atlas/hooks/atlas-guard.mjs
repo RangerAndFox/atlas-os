@@ -242,26 +242,48 @@ function tokenizeShell(s) {
 // so '+feature' / ':feature' cannot hide the marker. Returns a deny decision, or null to
 // fall through (allow) when the push is an explicit, clearly-safe feature push.
 function gitPushDecision(cmd, context) {
-  if (!/\bgit\b[^\n]*\bpush\b/.test(String(cmd))) return null;
+  // TOKENIZE FIRST, decide on tokens only. An earlier version regex-gated this on the
+  // raw string (`\bpush\b`), so a quote-split verb — `git p"ush"` — never reached the
+  // tokenizer at all. The tokenizer strips quotes, so on tokens `p"ush"` IS `push` and
+  // `g"it"` IS `git`; no raw-string check may stand in front of it.
   const toks = tokenizeShell(cmd);
-  const gi = toks.indexOf("git");
-  if (gi === -1) return null;
-  const pi = toks.indexOf("push", gi + 1);
-  if (pi === -1) return null;
   const deny = (why) => decide("deny", "forbidden-effect", `${why}\nCommand: ${String(cmd).slice(0, 400)}`, context);
-  const positionals = [];
-  for (const t of toks.slice(pi + 1)) {
-    if (t === ";" || t === "&" || t === "|") break; // only analyse this command
-    if (/^--force(-with-lease|-if-includes)?(=.*)?$/.test(t) || /^-[A-Za-z]*f[A-Za-z]*$/.test(t)) return deny("Force-push overwrites published history and requires a human.");
-    if (/^(--delete|--mirror|--prune)$/.test(t) || /^-[A-Za-z]*[dD][A-Za-z]*$/.test(t)) return deny("Deleting or pruning a remote ref requires a human.");
-    if (t.startsWith("+")) return deny("Force-push (via +refspec) requires a human.");
-    if (t.startsWith(":")) return deny("Deleting a remote ref (via :refspec) requires a human.");
-    if (/(?:^|:)(?:refs\/heads\/)?(?:main|master)$/.test(t)) return deny("Pushing directly to main/master requires a human — open a PR.");
-    if (!t.startsWith("-")) positionals.push(t);
+  // A quoted token carrying whitespace may be a whole sub-command (`sh -c "git push …"`).
+  // Recurse into it so wrapping the push in an interpreter string cannot hide it.
+  for (const t of toks) {
+    if (/\s/.test(t)) {
+      const sub = gitPushDecision(t, context);
+      if (sub) return sub;
+    }
   }
-  // Require an explicit remote AND refspec. A bare `git push` (or remote-only) could push
-  // the current branch — possibly main — with no branch named, so it is refused.
-  if (positionals.length < 2) return deny("Name an explicit remote and feature branch: `git push origin <branch>`. A bare push could reach a protected branch.");
+  // Analyse every `git … push` occurrence in every ;/&/| separated segment.
+  let i = 0;
+  while (i < toks.length) {
+    if (toks[i] !== "git") { i += 1; continue; }
+    // find `push` within this command segment
+    let pi = -1;
+    for (let j = i + 1; j < toks.length; j += 1) {
+      const t = toks[j];
+      if (t === ";" || t === "&" || t === "|") break;
+      if (t === "push") { pi = j; break; }
+    }
+    if (pi === -1) { i += 1; continue; }
+    const positionals = [];
+    for (let j = pi + 1; j < toks.length; j += 1) {
+      const t = toks[j];
+      if (t === ";" || t === "&" || t === "|") break; // only analyse this command
+      if (/^--force(-with-lease|-if-includes)?(=.*)?$/.test(t) || /^-[A-Za-z]*f[A-Za-z]*$/.test(t)) return deny("Force-push overwrites published history and requires a human.");
+      if (/^(--delete|--mirror|--prune)$/.test(t) || /^-[A-Za-z]*[dD][A-Za-z]*$/.test(t)) return deny("Deleting or pruning a remote ref requires a human.");
+      if (t.startsWith("+")) return deny("Force-push (via +refspec) requires a human.");
+      if (t.startsWith(":")) return deny("Deleting a remote ref (via :refspec) requires a human.");
+      if (/(?:^|:)(?:refs\/heads\/)?(?:main|master)$/.test(t)) return deny("Pushing directly to main/master requires a human — open a PR.");
+      if (!t.startsWith("-")) positionals.push(t);
+    }
+    // Require an explicit remote AND refspec. A bare `git push` (or remote-only) could
+    // push the current branch — possibly main — with no branch named, so it is refused.
+    if (positionals.length < 2) return deny("Name an explicit remote and feature branch: `git push origin <branch>`. A bare push could reach a protected branch.");
+    i = pi + 1;
+  }
   return null;
 }
 
@@ -576,7 +598,11 @@ try {
     // forbidden verb out of reach of the flag-skipping regexes. Detection only; this
     // never grants anything, it only makes the existing denials harder to evade.
     const stripQuoted = (s) => s.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
-    const variants = [cmd, cmdResolved, stripQuoted(cmd), stripQuoted(cmdResolved)];
+    // Tokens-rejoined variant: tokenization strips quotes, so a quote-split verb
+    // (`git reb"ase"`) or binary (`g"it" push`) reads as its real word here. Over-denial
+    // (a rule word appearing in quoted prose) is the safe direction for this list.
+    const rejoin = (s) => tokenizeShell(s).join(" ");
+    const variants = [cmd, cmdResolved, stripQuoted(cmd), stripQuoted(cmdResolved), rejoin(cmd), rejoin(cmdResolved)];
     for (const { re, why } of FORBIDDEN_COMMANDS) {
       if (variants.some((v) => re.test(v))) {
         return decide("deny", "forbidden-effect", `${why}\nCommand: ${cmd.slice(0, 400)}`, context);
