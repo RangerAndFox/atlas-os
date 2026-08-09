@@ -223,7 +223,7 @@ function tokenizeShell(s) {
       has = true;
     } else if (/\s/.test(ch)) {
       if (has) { toks.push(cur); cur = ""; has = false; }
-    } else if (ch === ";" || ch === "&" || ch === "|") {
+    } else if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === ")") {
       if (has) { toks.push(cur); cur = ""; has = false; }
       toks.push(ch);
     } else {
@@ -241,6 +241,15 @@ function tokenizeShell(s) {
 // from the current checkout) all require a human. Quotes are stripped by the tokeniser,
 // so '+feature' / ':feature' cannot hide the marker. Returns a deny decision, or null to
 // fall through (allow) when the push is an explicit, clearly-safe feature push.
+// True if a token invokes the git binary however it is spelled: `git`, `/usr/bin/git`,
+// `./git`, `\git`, `(git`, `g\it`, `"git"`. Backslashes (shell escapes that vanish at
+// runtime) and wrapping punctuation/quotes are removed, then the path basename is taken.
+// Matching the exact token "git" — the previous approach — let every one of these through.
+function isGitBinary(tok) {
+  const t = String(tok).replace(/\\/g, "").replace(/^[('"{]+/, "").replace(/[)'"}]+$/, "");
+  return t.split("/").pop() === "git";
+}
+
 function gitPushDecision(cmd, context) {
   // TOKENIZE FIRST, decide on tokens only. An earlier version regex-gated this on the
   // raw string (`\bpush\b`), so a quote-split verb — `git p"ush"` — never reached the
@@ -259,19 +268,19 @@ function gitPushDecision(cmd, context) {
   // Analyse every `git … push` occurrence in every ;/&/| separated segment.
   let i = 0;
   while (i < toks.length) {
-    if (toks[i] !== "git") { i += 1; continue; }
+    if (!isGitBinary(toks[i])) { i += 1; continue; }
     // find `push` within this command segment
     let pi = -1;
     for (let j = i + 1; j < toks.length; j += 1) {
       const t = toks[j];
-      if (t === ";" || t === "&" || t === "|") break;
+      if (t === ";" || t === "&" || t === "|" || t === "(" || t === ")") break;
       if (t === "push") { pi = j; break; }
     }
     if (pi === -1) { i += 1; continue; }
     const positionals = [];
     for (let j = pi + 1; j < toks.length; j += 1) {
       const t = toks[j];
-      if (t === ";" || t === "&" || t === "|") break; // only analyse this command
+      if (t === ";" || t === "&" || t === "|" || t === "(" || t === ")") break; // only this command
       if (/^--force(-with-lease|-if-includes)?(=.*)?$/.test(t) || /^-[A-Za-z]*f[A-Za-z]*$/.test(t)) return deny("Force-push overwrites published history and requires a human.");
       if (/^(--delete|--mirror|--prune)$/.test(t) || /^-[A-Za-z]*[dD][A-Za-z]*$/.test(t)) return deny("Deleting or pruning a remote ref requires a human.");
       if (t.startsWith("+")) return deny("Force-push (via +refspec) requires a human.");
