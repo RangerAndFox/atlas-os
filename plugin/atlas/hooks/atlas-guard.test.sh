@@ -124,6 +124,15 @@ check 2 atlas-implementer "direct push to main denied"               '{"tool_nam
 check 2 atlas-implementer "push to main via HEAD:main denied"        '{"tool_name":"Bash","tool_input":{"command":"git push origin HEAD:main"}}'
 check 2 atlas-implementer "EVASION: force hidden by quoted -c"       '{"tool_name":"Bash","tool_input":{"command":"git -c credential.helper='"'"'!gh auth git-credential'"'"' push --force origin x"}}'
 check 2 atlas-implementer "EVASION: delete hidden by quoted -c"      '{"tool_name":"Bash","tool_input":{"command":"git -c a='"'"'b c'"'"' push origin :feature"}}'
+check 2 atlas-implementer "EVASION: force via QUOTED +refspec"       '{"tool_name":"Bash","tool_input":{"command":"git push origin '"'"'+feature'"'"'"}}'
+check 2 atlas-implementer "EVASION: delete via QUOTED :refspec"      '{"tool_name":"Bash","tool_input":{"command":"git push origin '"'"':feature'"'"'"}}'
+check 2 atlas-implementer "EVASION: force via double-quoted +ref"    '{"tool_name":"Bash","tool_input":{"command":"git push origin \"+feature\""}}'
+check 2 atlas-implementer "bare push denied (could reach main)"      '{"tool_name":"Bash","tool_input":{"command":"git push"}}'
+check 2 atlas-implementer "remote-only push denied (no refspec)"     '{"tool_name":"Bash","tool_input":{"command":"git push origin"}}'
+check 0 atlas-implementer "branch NAMED with main is allowed"        '{"tool_name":"Bash","tool_input":{"command":"git push origin feature/main-fix"}}'
+check 2 atlas-implementer "force-with-lease with =ref denied"        '{"tool_name":"Bash","tool_input":{"command":"git push --force-with-lease=origin/x origin feature"}}'
+check 2 atlas-implementer "push to refs/heads/main denied"           '{"tool_name":"Bash","tool_input":{"command":"git push origin refs/heads/main"}}'
+check 2 atlas-implementer "push local:main denied"                   '{"tool_name":"Bash","tool_input":{"command":"git push origin feature:main"}}'
 
 echo
 echo "HARNESS SCRATCH (Option B) — plan/todo files outside the repo, narrowly allowed"

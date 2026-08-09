@@ -205,6 +205,66 @@ function isHarnessScratch(target) {
   }
 }
 
+// Quote-aware shell tokeniser: strips surrounding quotes, keeps a quoted value with
+// spaces as ONE token, and emits ; & | as their own tokens so a second command can't
+// merge into the first. Not a full shell parser — enough to inspect a git push safely.
+function tokenizeShell(s) {
+  const toks = [];
+  let cur = "";
+  let has = false;
+  let q = null;
+  for (const ch of String(s)) {
+    if (q) {
+      if (ch === q) q = null;
+      else { cur += ch; }
+      has = true;
+    } else if (ch === "'" || ch === '"') {
+      q = ch;
+      has = true;
+    } else if (/\s/.test(ch)) {
+      if (has) { toks.push(cur); cur = ""; has = false; }
+    } else if (ch === ";" || ch === "&" || ch === "|") {
+      if (has) { toks.push(cur); cur = ""; has = false; }
+      toks.push(ch);
+    } else {
+      cur += ch;
+      has = true;
+    }
+  }
+  if (has) toks.push(cur);
+  return toks;
+}
+
+// Push policy (Option A), enforced by DENY-BY-DEFAULT on the parsed tokens rather than a
+// leaky regex. A feature-branch push is allowed; force, remote-delete/prune, direct
+// main/master, and a bare/underspecified push (which could reach a protected branch
+// from the current checkout) all require a human. Quotes are stripped by the tokeniser,
+// so '+feature' / ':feature' cannot hide the marker. Returns a deny decision, or null to
+// fall through (allow) when the push is an explicit, clearly-safe feature push.
+function gitPushDecision(cmd, context) {
+  if (!/\bgit\b[^\n]*\bpush\b/.test(String(cmd))) return null;
+  const toks = tokenizeShell(cmd);
+  const gi = toks.indexOf("git");
+  if (gi === -1) return null;
+  const pi = toks.indexOf("push", gi + 1);
+  if (pi === -1) return null;
+  const deny = (why) => decide("deny", "forbidden-effect", `${why}\nCommand: ${String(cmd).slice(0, 400)}`, context);
+  const positionals = [];
+  for (const t of toks.slice(pi + 1)) {
+    if (t === ";" || t === "&" || t === "|") break; // only analyse this command
+    if (/^--force(-with-lease|-if-includes)?(=.*)?$/.test(t) || /^-[A-Za-z]*f[A-Za-z]*$/.test(t)) return deny("Force-push overwrites published history and requires a human.");
+    if (/^(--delete|--mirror|--prune)$/.test(t) || /^-[A-Za-z]*[dD][A-Za-z]*$/.test(t)) return deny("Deleting or pruning a remote ref requires a human.");
+    if (t.startsWith("+")) return deny("Force-push (via +refspec) requires a human.");
+    if (t.startsWith(":")) return deny("Deleting a remote ref (via :refspec) requires a human.");
+    if (/(?:^|:)(?:refs\/heads\/)?(?:main|master)$/.test(t)) return deny("Pushing directly to main/master requires a human — open a PR.");
+    if (!t.startsWith("-")) positionals.push(t);
+  }
+  // Require an explicit remote AND refspec. A bare `git push` (or remote-only) could push
+  // the current branch — possibly main — with no branch named, so it is refused.
+  if (positionals.length < 2) return deny("Name an explicit remote and feature branch: `git push origin <branch>`. A bare push could reach a protected branch.");
+  return null;
+}
+
 function decide(verdict, rule, detail, context) {
   try {
     mkdirSync(path.join(ATLAS_DIR, "evidence"), { recursive: true });
@@ -338,9 +398,11 @@ const FORBIDDEN_COMMANDS = [
   // quoted global option carrying spaces (e.g. `git -c x='a b' push --force`) cannot
   // hide the marker — the evasion that slipped the old blanket rule. Over-denial (a
   // marker word appearing elsewhere on the line) is the safe direction.
-  { re: /\bgit\b[^\n]*\bpush\b[^\n]*(?:--force\b|--force-with-lease\b|(?:^|\s)-[A-Za-z]*f[A-Za-z]*\b|(?:^|\s)\+)/, why: "Force-push overwrites published history and requires a human." },
-  { re: /\bgit\b[^\n]*\bpush\b[^\n]*(?:--delete\b|--mirror\b|--prune\b|(?:^|\s)-[A-Za-z]*[dD][A-Za-z]*\b|(?:^|\s):[^\s]+)/, why: "Deleting or pruning a remote ref requires a human (covers --delete, -d/-D, --mirror, --prune, :refspec)." },
-  { re: /\bgit\b[^\n]*\bpush\b[^\n]*\b(?:main|master)\b/, why: "Pushing directly to main/master requires a human — open a PR." },
+  // NOTE: `git push` is NOT matched here. Regex blocklists kept leaking — a quoted
+  // refspec ('+feature' / ':feature') put the marker behind a quote, and no regex could
+  // require an explicit refspec (a bare `git push` from a main checkout reaches main).
+  // Push is handled by gitPushDecision() below: a quote-aware tokeniser that DENIES by
+  // default and allows only an explicit, non-force, non-delete, non-main feature refspec.
   { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(commit\s+--amend|rebase|reset\s+--hard|filter-branch|filter-repo)\b/, why: "History mutation requires a human." },
   { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(tag|switch|checkout)\s+.*(-d|-D|--delete)\b/, why: "Ref deletion requires a human." },
   { re: /\bgh\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(pr\s+(merge|review)|release|workflow\s+run|api\b.*(-X|--method)\s*(POST|PUT|PATCH|DELETE))/, why: "Merging, approving, releasing and write-API calls are human authority." },
@@ -504,6 +566,11 @@ try {
     // through it. Check both the literal command and this one-hop resolution so
     // the existing regexes see the effective command, not just the written one.
     const cmdResolved = resolveSimpleVarIndirection(cmd);
+    // Push is analysed by a quote-aware tokeniser (deny-by-default), not the regex list.
+    for (const c of [cmd, cmdResolved]) {
+      const pv = gitPushDecision(c, context);
+      if (pv) return pv;
+    }
     // Neutralise quoted argument VALUES (keeping empty quotes as a token boundary) so a
     // global option carrying spaces — e.g. `git -c x='a b' push` — cannot push the
     // forbidden verb out of reach of the flag-skipping regexes. Detection only; this
