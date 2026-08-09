@@ -339,7 +339,7 @@ const FORBIDDEN_COMMANDS = [
   // hide the marker — the evasion that slipped the old blanket rule. Over-denial (a
   // marker word appearing elsewhere on the line) is the safe direction.
   { re: /\bgit\b[^\n]*\bpush\b[^\n]*(?:--force\b|--force-with-lease\b|(?:^|\s)-[A-Za-z]*f[A-Za-z]*\b|(?:^|\s)\+)/, why: "Force-push overwrites published history and requires a human." },
-  { re: /\bgit\b[^\n]*\bpush\b[^\n]*(?:--delete\b|(?:^|\s):[^\s]+)/, why: "Deleting a remote ref requires a human." },
+  { re: /\bgit\b[^\n]*\bpush\b[^\n]*(?:--delete\b|--mirror\b|--prune\b|(?:^|\s)-[A-Za-z]*[dD][A-Za-z]*\b|(?:^|\s):[^\s]+)/, why: "Deleting or pruning a remote ref requires a human (covers --delete, -d/-D, --mirror, --prune, :refspec)." },
   { re: /\bgit\b[^\n]*\bpush\b[^\n]*\b(?:main|master)\b/, why: "Pushing directly to main/master requires a human — open a PR." },
   { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(commit\s+--amend|rebase|reset\s+--hard|filter-branch|filter-repo)\b/, why: "History mutation requires a human." },
   { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(tag|switch|checkout)\s+.*(-d|-D|--delete)\b/, why: "Ref deletion requires a human." },
