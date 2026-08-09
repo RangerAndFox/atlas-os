@@ -277,6 +277,12 @@ function gitPushDecision(cmd, context) {
       if (t.startsWith("+")) return deny("Force-push (via +refspec) requires a human.");
       if (t.startsWith(":")) return deny("Deleting a remote ref (via :refspec) requires a human.");
       if (/(?:^|:)(?:refs\/heads\/)?(?:main|master)$/.test(t)) return deny("Pushing directly to main/master requires a human — open a PR.");
+      // HEAD/@ are pronouns for "whatever is checked out" — possibly main. Without an
+      // explicit :destination they are an unnamed push and are refused. HEAD:feature
+      // names its destination and passes (a :main destination is already denied above).
+      if (!t.includes(":") && (t === "HEAD" || /^HEAD[~^@]/.test(t) || t === "@" || t.startsWith("@{"))) {
+        return deny("Pushing HEAD/@ pushes whatever branch is checked out — possibly main. Name the branch explicitly: `git push origin <branch>`.");
+      }
       if (!t.startsWith("-")) positionals.push(t);
     }
     // Require an explicit remote AND refspec. A bare `git push` (or remote-only) could
