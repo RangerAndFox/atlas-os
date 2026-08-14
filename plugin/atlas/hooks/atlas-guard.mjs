@@ -189,6 +189,418 @@ function relativize(target) {
   return rel.split(path.sep).join("/");
 }
 
+// The harness's own ephemeral scratch (plan-mode + todo files) lives under ~/.claude/
+// outside the repo. Allow ONLY those two directories — never the rest of ~/.claude/,
+// which holds settings.json; writing there would let a session widen its own
+// permissions, the one escalation this must never permit.
+function isHarnessScratch(target) {
+  try {
+    const home = process.env.HOME || "";
+    if (!home || !target) return false;
+    const abs = path.resolve(target.startsWith("~/") ? path.join(home, target.slice(2)) : target);
+    const bases = [path.join(home, ".claude", "plans"), path.join(home, ".claude", "todos")];
+    return bases.some((b) => abs === b || abs.startsWith(b + path.sep));
+  } catch {
+    return false;
+  }
+}
+
+// Quote-aware shell tokeniser: strips surrounding quotes, keeps a quoted value with
+// spaces as ONE token, and emits ; & | ( ) AND a newline as their own tokens so a
+// second command can't merge into the first. Not a full shell parser — enough to
+// inspect a git push safely.
+//
+// A NEWLINE IS A COMMAND SEPARATOR. It used to fall through to the generic
+// whitespace branch, so a following command's words were absorbed as arguments of
+// the first: `git push\ngit status` tokenised as `git push git status`, which
+// satisfied the ">= 2 positionals" bare-push rule and was ALLOWED — it pushed the
+// checked-out branch (main) to the remote. `git push;git status` denied correctly.
+// Verified end-to-end against a bare remote before and after this change.
+//
+// A backslash immediately before the newline is a shell LINE CONTINUATION: the
+// newline is removed and the command continues, so it must be treated as a word
+// break only, never as a command boundary. Otherwise a legitimate multi-line
+// `git push \<nl> origin feature/x` would be denied as a bare push.
+const SEP_TOKENS = new Set([";", "&", "|", "(", ")", "\n"]);
+const isSepToken = (t) => SEP_TOKENS.has(t);
+
+function tokenizeShell(s) {
+  const toks = [];
+  let cur = "";
+  let has = false;
+  let q = null;
+  let prevBackslash = false; // last char was an unquoted, unescaped backslash
+  // CRLF (and a lone CR) normalise to LF so a Windows-style line ending is one
+  // separator, and a `\`+CRLF continuation is still recognised as a continuation.
+  for (const ch of String(s).replace(/\r\n?/g, "\n")) {
+    if (q) {
+      if (ch === q) q = null;
+      else { cur += ch; }
+      has = true;
+      prevBackslash = false;
+    } else if (ch === "'" || ch === '"') {
+      q = ch;
+      has = true;
+      prevBackslash = false;
+    } else if (ch === "\n") {
+      if (prevBackslash) {
+        // Line continuation: the shell deletes the `\` AND the newline, and the
+        // word continues on the next line. Emitting a separator here would deny a
+        // legitimate multi-line `git push \<nl> origin feature/x`; emitting a token
+        // boundary would split `ma\<nl>in` into two harmless-looking words.
+        cur = cur.slice(0, -1);
+        if (cur === "") has = false;
+        prevBackslash = false;
+        continue;
+      }
+      if (has) { toks.push(cur); cur = ""; has = false; }
+      if (toks[toks.length - 1] !== "\n") toks.push("\n");
+    } else if (/\s/.test(ch)) {
+      if (has) { toks.push(cur); cur = ""; has = false; }
+      prevBackslash = false;
+    } else if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === ")") {
+      if (has) { toks.push(cur); cur = ""; has = false; }
+      toks.push(ch);
+      prevBackslash = false;
+    } else {
+      cur += ch;
+      has = true;
+      prevBackslash = ch === "\\" ? !prevBackslash : false;
+    }
+  }
+  if (has) toks.push(cur);
+  return toks;
+}
+
+// Push policy (Option A), enforced by DENY-BY-DEFAULT on the parsed tokens rather than a
+// leaky regex. A feature-branch push is allowed; force, remote-delete/prune, direct
+// main/master, and a bare/underspecified push (which could reach a protected branch
+// from the current checkout) all require a human. Quotes are stripped by the tokeniser,
+// so '+feature' / ':feature' cannot hide the marker. Returns a deny decision, or null to
+// fall through (allow) when the push is an explicit, clearly-safe feature push.
+// True if a token invokes the git binary however it is spelled: `git`, `/usr/bin/git`,
+// `./git`, `\git`, `(git`, `g\it`, `"git"`. Backslashes (shell escapes that vanish at
+// runtime) and wrapping punctuation/quotes are removed, then the path basename is taken.
+// Matching the exact token "git" — the previous approach — let every one of these through.
+function isGitBinary(tok) {
+  const t = String(tok).replace(/\\/g, "").replace(/^[('"{]+/, "").replace(/[)'"}]+$/, "");
+  return t.split("/").pop() === "git";
+}
+
+/* ---------------------------------------------------------------------------
+ * OPTION-ARITY TABLE for `git push` (arity is a fact, not a heuristic)
+ *
+ * The bare-push rule counts POSITIONALS ("a push with < 2 positionals names no
+ * refspec, so it could reach main → deny"). Any option whose value is a SEPARATE
+ * following word donated a phantom positional to that count, which inverted the
+ * rule: `git push -o ci.skip origin` counted `ci.skip` + `origin` = 2 positionals,
+ * was judged "explicit", and pushed the checked-out branch — main — to the remote.
+ * Verified end-to-end against a bare remote.
+ *
+ * Arity cannot be guessed from the spelling, so it is tabulated from
+ * `git push -h` / builtin/push.c, and ANYTHING NOT IN THE TABLE FAILS CLOSED.
+ * That is the load-bearing property: git's parse-options accepts unambiguous
+ * long-option ABBREVIATIONS (`--push-opt`, `--rece`, `--exe`), so an exact-spelling
+ * table alone would leak forever. Denying unknown option-shaped tokens costs a
+ * possible false denial of some future/abbreviated flag — the safe direction, and
+ * the agent can always spell the option out in full.
+ *
+ * SEPARATE-VALUE (consume the next word; the value is NOT a positional). Each also
+ * accepts the value attached (`--repo=origin`, `-oci.skip`), which consumes nothing.
+ *   --repo <repository>            -o / --push-option <option>
+ *   --recurse-submodules <mode>    --receive-pack / --exec <program>   (see below)
+ * ATTACHED-VALUE ONLY (`[=value]` in the help text — NEVER consumes the next word;
+ * writing `--signed yes` makes `yes` a genuine positional, which is correct):
+ *   --force-with-lease[=<ref>:<expect>]      --signed[=(yes|no|if-asked)]
+ * ZERO-ARITY: everything in PUSH_OPT_ZERO below.
+ *
+ * `--receive-pack` / `--exec` are DENIED rather than merely consumed: they name a
+ * program for the REMOTE to execute. Nothing in an agent's feature-push workflow
+ * needs that, and consuming the value would have left
+ * `git push --receive-pack X origin feature` allowed. `--all` / `--branches` are
+ * denied for the same reason as a bare push — they push every local branch,
+ * including main, with no refspec on the command line.
+ * ------------------------------------------------------------------------- */
+const PUSH_OPT_SEPARATE = new Set([
+  "--repo", "--push-option", "-o", "--recurse-submodules",
+]);
+const PUSH_OPT_ATTACHED_ONLY = new Set([
+  "--force-with-lease", "--signed",
+]);
+const PUSH_OPT_ZERO = new Set([
+  "--verbose", "--no-verbose", "--quiet", "--no-quiet",
+  "--dry-run", "--no-dry-run", "--porcelain", "--no-porcelain",
+  "--thin", "--no-thin", "--set-upstream", "--no-set-upstream",
+  "--progress", "--no-progress", "--verify", "--no-verify",
+  "--follow-tags", "--no-follow-tags", "--atomic", "--no-atomic",
+  "--tags", "--no-tags", "--ipv4", "--ipv6",
+  "--no-recurse-submodules", "--no-repo", "--no-push-option", "--no-signed",
+  "--no-force-with-lease", "--force-if-includes", "--no-force-if-includes",
+  // These are zero-arity but dangerous; the checks above deny them first. Listed
+  // so their `--no-` forms and their arity are recorded rather than inferred.
+  "--force", "--no-force", "--delete", "--no-delete",
+  "--mirror", "--no-mirror", "--prune", "--no-prune",
+]);
+// Short options that take no value. `-f`, `-d`, `-D` are absent on purpose: the
+// force/delete rules deny any cluster containing them before arity is consulted.
+const PUSH_OPT_ZERO_SHORT = new Set(["v", "q", "n", "u", "4", "6"]);
+
+/**
+ * Classify one option-shaped token that appears after `push`.
+ * Returns { skip: true } (option consumes nothing), { consume: true } (the NEXT
+ * token is this option's value and must not be counted as a positional), or
+ * { deny: <reason> }. Unknown → deny, by design.
+ */
+function classifyPushOption(tok, nextTok) {
+  if (/^--(receive-pack|exec)(=|$)/.test(tok)) {
+    return { deny: "`--receive-pack`/`--exec` tell the remote which program to run to receive the push. That is not part of any agent workflow and requires a human." };
+  }
+  if (/^--(all|branches)$/.test(tok)) {
+    return { deny: "`--all`/`--branches` pushes every local branch, including main, with no refspec named. Push one feature branch explicitly." };
+  }
+  if (tok === "--" || tok === "-") {
+    return { deny: "`--`/`-` as a push argument makes the refspec list ambiguous to a static check, so it requires a human." };
+  }
+  if (tok.startsWith("--")) {
+    const eq = tok.indexOf("=");
+    const name = eq === -1 ? tok : tok.slice(0, eq);
+    const known = PUSH_OPT_SEPARATE.has(name) || PUSH_OPT_ATTACHED_ONLY.has(name) || PUSH_OPT_ZERO.has(name);
+    if (!known) {
+      return { deny: `\`${name}\` is not a recognised \`git push\` option, so the guard cannot know whether it swallows the next word as its value (which would let a refspec-less push look explicit). Unknown options fail closed — spell the option out in full, or hand the command to a human.` };
+    }
+    if (eq !== -1) return { skip: true }; // value attached, consumes nothing
+    if (PUSH_OPT_SEPARATE.has(name)) {
+      if (nextTok === undefined || isSepToken(nextTok)) {
+        return { deny: `\`${name}\` expects a value and none follows it; the command as written cannot be evaluated.` };
+      }
+      return { consume: true };
+    }
+    return { skip: true };
+  }
+  // Short-option cluster: `-uq`, `-oci.skip`, `-qo ci.skip`. The first char that
+  // takes a value swallows the rest of the cluster, or the next word if the
+  // cluster ends there — exactly how git's parse-options behaves.
+  const body = tok.slice(1);
+  if (body === "") return { deny: "A bare `-` is not a valid push argument." };
+  for (let k = 0; k < body.length; k += 1) {
+    const c = body[k];
+    if (c === "o") {
+      if (k + 1 < body.length) return { skip: true }; // -oci.skip: value attached
+      if (nextTok === undefined || isSepToken(nextTok)) {
+        return { deny: "`-o` expects a push option value and none follows it." };
+      }
+      return { consume: true };
+    }
+    if (!PUSH_OPT_ZERO_SHORT.has(c)) {
+      return { deny: `\`-${c}\` is not a recognised \`git push\` short option, so the guard cannot know whether it swallows the next word as its value. Unknown options fail closed.` };
+    }
+  }
+  return { skip: true };
+}
+
+/* ---------------------------------------------------------------------------
+ * `git -c <key>=<value> … push` — ad-hoc config on the git BINARY.
+ *
+ * DECISION: deny `-c` (and `--config-env`) when the key can influence where a push
+ * goes or how it authenticates; allow other keys. Reasoning and cost are recorded in
+ * FINDINGS.md. The exploit this closes:
+ *   git -c remote.origin.push=+HEAD:refs/heads/main push -o ci.skip origin
+ * `remote.<name>.push` supplies the refspec when the command line does not, so a
+ * push with no refspec on the line becomes a FORCE write of main. Observed to
+ * destroy a commit on a real bare remote.
+ *
+ * A blanket deny of every `-c` is also defensible (an agent has no need for ad-hoc
+ * config on a push) and is a one-line change, but it flips the pre-existing test
+ * "safe feature push via -c is ALLOWED" (`git -c a=b push -u origin feature`), which
+ * is an owner decision, not a bug to be silently rewritten. See FINDINGS.md.
+ */
+const GIT_C_DENY_KEY = /^(remote|push|url|credential|http|https|ssh|include|includeif|alias|receive|uploadpack|protocol|safe|transfer|pack|gpg|filter|browser|pager|sequence|diff\.external|core\.(hookspath|sshcommand|gitproxy|askpass|pager|editor|fsmonitor|alternaterefsprefixes))([.]|$)/i;
+
+function gitConfigInjectionDeny(value) {
+  const v = String(value === undefined ? "" : value);
+  if (/[$`]/.test(v)) {
+    return "a `-c` config value built from a variable or command substitution cannot be checked statically";
+  }
+  const m = /^([A-Za-z0-9._-]+)=/.exec(v);
+  if (!m) {
+    return `\`-c ${v.slice(0, 60)}\` is not a plain <key>=<value>, so the guard cannot tell what it configures`;
+  }
+  if (GIT_C_DENY_KEY.test(m[1])) {
+    return `\`-c ${m[1]}=…\` can change where a push goes, or how it authenticates (a \`remote.*.push\` refspec turns a refspec-less push into a write of main)`;
+  }
+  return null;
+}
+
+// WHAT THIS IS, AND WHAT IT IS NOT.
+// This function is DEFENCE IN DEPTH, not the control that protects `main`. Deciding what
+// a shell command will actually do is undecidable in general (variables, substitution,
+// aliases, config, `eval`, the agent's free choice of spelling), so a blocklist of
+// dangerous spellings leaks indefinitely — every fix below was a leak found after the
+// previous fix shipped. The AUTHORITATIVE control is the SERVER-SIDE GitHub ruleset on
+// the protected branch (plus CODEOWNERS and required status checks): it is evaluated by
+// the remote, on the real ref, after every spelling has collapsed to bytes on the wire.
+// This function only raises the cost of an accident and makes a deliberate bypass
+// visible in the evidence log. Do not treat a non-denial here as proof a push was safe,
+// and do not weaken the ruleset because this exists.
+//
+// CLOSED 2026-08-13 (each was verified to write remote `main` BEFORE the fix and to be
+// denied AFTER it, by executing the command against a real bare remote — see FINDINGS.md
+// in this directory for the before/after SHAs):
+//   1. OPTION-ARITY INFLATION defeated the ">= 2 positionals" bare-push rule: an option
+//      whose value is a SEPARATE following word donated a phantom positional, so
+//      `git push -o ci.skip origin` counted as "explicit" and pushed the checked-out
+//      branch (main). Closed by the OPTION-ARITY TABLE above, which fails CLOSED on any
+//      option-shaped token it does not recognise (including git's long-option
+//      abbreviations, e.g. `--push-opt`, which no exact-spelling table could cover).
+//   2. CONFIG-INJECTED REFSPEC, which compounded (1): `remote.<name>.push` supplies the
+//      refspec when the command line does not, so
+//      `git -c remote.origin.push=+HEAD:refs/heads/main push -o ci.skip origin`
+//      force-wrote main (observed destroying a commit). Closed twice over: the arity fix
+//      makes it a bare push, and push-affecting `-c` keys / `GIT_*` env assignments /
+//      `--config-env` are now denied on a push segment.
+//   3. NEWLINE IS NOW A COMMAND SEPARATOR. tokenizeShell() treated `\n` as ordinary
+//      whitespace, so the next command's words were absorbed as positionals of the push:
+//      `git push\ngit status` was allowed and was a bare push. `\n` is now emitted as a
+//      separator token like `;` (with `\`-continuation handled), and each command in a
+//      multi-line block is judged on its own.
+//
+// KNOWN RESIDUAL EVASIONS (left OPEN deliberately — the ruleset is the control, and
+// chasing spellings here is the failure mode):
+//   4. CASE VARIANTS of the branch name are not matched (`git push origin MAIN`, `Main`).
+//      On a case-sensitive ref store these create a distinct ref and are harmless; on a
+//      case-insensitive one they can reach main. Not fixed because case-folding refnames
+//      would be wrong on Linux.
+//   5. CONFIG ALREADY ON DISK. `-c`/`GIT_*` are the inline routes; a value already in
+//      `.git/config` or a global config file is invisible here. Measured against git
+//      2.43: with an EXPLICIT refspec present (the only push this guard allows),
+//      `remote.*.push` and `push.default` are ignored and `remote.*.mirror` errors out,
+//      so on-disk config cannot turn an allowed push into a write of main. What it CAN
+//      still do is REDIRECT the allowed feature push to another host
+//      (`remote.*.pushurl`, `url.*.pushInsteadOf`). `.git/**` is a protected path, so
+//      the shell cannot write it, but a pre-existing value is not detected.
+//   6. AN OBSCURE `-c` KEY that affects a push and is outside GIT_C_DENY_KEY still passes
+//      (the `-c` rule is a deny-list, not an allow-list — see the DECISION note above).
+//   7. WRAPPERS AND INDIRECTION: an alias, a shell function, a script in the repo, `xargs`,
+//      `find -exec`, a Makefile target or an MCP/other tool surface that shells out can all
+//      reach `git push` without the word `push` ever appearing in the checked command.
+// NON-issues confirmed by the same audit, recorded so they are not re-chased: ANSI-C and
+// `$"…"` quoting (`$'main'`, `$'ma\x69n'`), IFS manipulation, `--` end-of-options,
+// `git -C <dir> push origin main`, and env-var-assigned refs all DENY already (the `$`/
+// backtick rule and the backslash normalisation below cover them). Unicode homoglyphs
+// (`maіn` with Cyrillic і, or a zero-width joiner) ALLOW but are a DIFFERENT ref than
+// `main` and so cannot reach it. A trailing space (`feature:refs/heads/main `) ALLOWs but
+// `git check-ref-format` rejects the refname, so it is not reachable.
+function gitPushDecision(cmd, context) {
+  // TOKENIZE FIRST, decide on tokens only. An earlier version regex-gated this on the
+  // raw string (`\bpush\b`), so a quote-split verb — `git p"ush"` — never reached the
+  // tokenizer at all. The tokenizer strips quotes, so on tokens `p"ush"` IS `push` and
+  // `g"it"` IS `git`; no raw-string check may stand in front of it.
+  const toks = tokenizeShell(cmd);
+  const deny = (why) => decide("deny", "forbidden-effect", `${why}\nCommand: ${String(cmd).slice(0, 400)}`, context);
+  // A quoted token carrying whitespace may be a whole sub-command (`sh -c "git push …"`).
+  // Recurse into it so wrapping the push in an interpreter string cannot hide it.
+  for (const t of toks) {
+    // isSepToken guard: the newline separator token is itself whitespace, so without
+    // this the recursion re-tokenised "\n" into ["\n"] forever (stack overflow → the
+    // fail-closed handler denied every multi-line command, safe but useless).
+    if (!isSepToken(t) && /\s/.test(t)) {
+      const sub = gitPushDecision(t, context);
+      if (sub) return sub;
+    }
+  }
+  // Strip backslashes from every token before analysis: the shell removes an unquoted
+  // `\` before git ever sees it, so `ma\in` is `main`, `--fo\rce` is `--force`, `-\d` is
+  // `-d`. Checking the un-normalised token (as an earlier version did for the markers,
+  // though not the binary) let a single backslash defeat every dangerous-push rule.
+  const ntoks = toks.map((t) => t.replace(/\\/g, ""));
+  // Analyse every `git … push` occurrence in every ;/&/| separated segment.
+  let i = 0;
+  while (i < ntoks.length) {
+    if (!isGitBinary(ntoks[i])) { i += 1; continue; }
+    // find `push` within this command segment
+    let pi = -1;
+    for (let j = i + 1; j < ntoks.length; j += 1) {
+      const t = ntoks[j];
+      if (isSepToken(t)) break;
+      if (t === "push") { pi = j; break; }
+    }
+    if (pi === -1) { i += 1; continue; }
+    // Everything between the start of this shell command and `push` is either an
+    // env-var assignment prefix or a git BINARY option. Both can redirect the push.
+    let segStart = 0;
+    for (let k = i - 1; k >= 0; k -= 1) {
+      if (isSepToken(ntoks[k])) { segStart = k + 1; break; }
+    }
+    for (let j = segStart; j < pi; j += 1) {
+      const t = ntoks[j];
+      // GIT_CONFIG_GLOBAL / GIT_CONFIG_COUNT / GIT_DIR / GIT_SSH_COMMAND … reach the
+      // same place `-c` does, through the environment instead of the command line.
+      if (/^GIT_[A-Za-z0-9_]*=/.test(t)) {
+        return deny(`A \`GIT_*\` environment assignment on a push (\`${t.split("=")[0]}=…\`) can supply configuration — including a \`remote.*.push\` refspec — that decides where the push actually goes. Remove it, or hand the command to a human.`);
+      }
+      if (t === "-c" || t === "--config-env") {
+        const why = gitConfigInjectionDeny(ntoks[j + 1]);
+        if (why) return deny(`Ad-hoc git config on a push is refused: ${why}.`);
+        if (t === "--config-env") {
+          return deny("`--config-env` takes its config value from an environment variable, which a static check cannot read. It requires a human.");
+        }
+        j += 1; // the key=value is this option's value, not a further option
+        continue;
+      }
+      if (t.startsWith("--config-env=")) {
+        return deny("`--config-env` takes its config value from an environment variable, which a static check cannot read. It requires a human.");
+      }
+      if (t.startsWith("-c") && t.length > 2) {
+        const why = gitConfigInjectionDeny(t.slice(2));
+        if (why) return deny(`Ad-hoc git config on a push is refused: ${why}.`);
+      }
+    }
+    const positionals = [];
+    for (let j = pi + 1; j < ntoks.length; j += 1) {
+      const t = ntoks[j];
+      if (isSepToken(t)) break; // only this command
+      // Shell substitution/expansion in a push argument ($(…), `…`, $VAR) makes the real
+      // target unknowable to a static check — `git push origin $(echo main)` resolves to
+      // main. A legitimate feature push never needs it, so any such argument is refused.
+      if (t.includes("$") || t.includes("`")) return deny("A push argument uses shell substitution or a variable ($(…), `…`, $VAR); its real target can't be checked statically, so it requires a human.");
+      if (/^--force(-with-lease|-if-includes)?(=.*)?$/.test(t) || /^-[A-Za-z]*f[A-Za-z]*$/.test(t)) return deny("Force-push overwrites published history and requires a human.");
+      if (/^(--delete|--mirror|--prune)$/.test(t) || /^-[A-Za-z]*[dD][A-Za-z]*$/.test(t)) return deny("Deleting or pruning a remote ref requires a human.");
+      if (t.startsWith("+")) return deny("Force-push (via +refspec) requires a human.");
+      if (t.startsWith(":")) return deny("Deleting a remote ref (via :refspec) requires a human.");
+      if (/(?:^|:)(?:refs\/heads\/)?(?:main|master)$/.test(t)) return deny("Pushing directly to main/master requires a human — open a PR.");
+      // HEAD/@ are pronouns for "whatever is checked out" — possibly main. Without an
+      // explicit :destination they are an unnamed push and are refused. HEAD:feature
+      // names its destination and passes (a :main destination is already denied above).
+      if (!t.includes(":") && (t === "HEAD" || /^HEAD[~^@]/.test(t) || t === "@" || t.startsWith("@{"))) {
+        return deny("Pushing HEAD/@ pushes whatever branch is checked out — possibly main. Name the branch explicitly: `git push origin <branch>`.");
+      }
+      // OPTION ARITY. Every option-shaped token is classified against the table
+      // above: it either consumes nothing, consumes the next word (which must NOT
+      // be counted as a positional), or is unknown and denies. Before this, every
+      // `-*` token was simply skipped and its separate value was miscounted as a
+      // refspec — the bug that made `git push -o ci.skip origin` an allowed bare push.
+      if (t.startsWith("-")) {
+        const cls = classifyPushOption(t, ntoks[j + 1]);
+        if (cls.deny) return deny(cls.deny);
+        if (cls.consume) {
+          const val = ntoks[j + 1];
+          if (val.includes("$") || val.includes("`")) {
+            return deny(`The value of \`${t}\` uses shell substitution or a variable; its real content can't be checked statically, so it requires a human.`);
+          }
+          j += 1;
+        }
+        continue;
+      }
+      if (t !== "") positionals.push(t);
+    }
+    // Require an explicit remote AND refspec. A bare `git push` (or remote-only) could
+    // push the current branch — possibly main — with no branch named, so it is refused.
+    if (positionals.length < 2) return deny("Name an explicit remote and feature branch: `git push origin <branch>`. A bare push could reach a protected branch.");
+    i = pi + 1;
+  }
+  return null;
+}
+
 function decide(verdict, rule, detail, context) {
   try {
     mkdirSync(path.join(ATLAS_DIR, "evidence"), { recursive: true });
@@ -316,7 +728,17 @@ const DEFAULT_SECRETS = [
 // Effects that must never be reachable from an agent, in any mission.
 // Publication, history mutation, infrastructure and destructive commands.
 const FORBIDDEN_COMMANDS = [
-  { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*push\b/, why: "Publication requires a human. Push is the release boundary." },
+  // Push is ALLOWED for feature branches — the machine account opens agent PRs, and
+  // the independent reviewer + branch ruleset are the real merge gates. Only the
+  // dangerous forms stay human-only. The broad `git … push … <marker>` shape means a
+  // quoted global option carrying spaces (e.g. `git -c x='a b' push --force`) cannot
+  // hide the marker — the evasion that slipped the old blanket rule. Over-denial (a
+  // marker word appearing elsewhere on the line) is the safe direction.
+  // NOTE: `git push` is NOT matched here. Regex blocklists kept leaking — a quoted
+  // refspec ('+feature' / ':feature') put the marker behind a quote, and no regex could
+  // require an explicit refspec (a bare `git push` from a main checkout reaches main).
+  // Push is handled by gitPushDecision() below: a quote-aware tokeniser that DENIES by
+  // default and allows only an explicit, non-force, non-delete, non-main feature refspec.
   { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(commit\s+--amend|rebase|reset\s+--hard|filter-branch|filter-repo)\b/, why: "History mutation requires a human." },
   { re: /\bgit\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(tag|switch|checkout)\s+.*(-d|-D|--delete)\b/, why: "Ref deletion requires a human." },
   { re: /\bgh\s+(?:(?:-[A-Za-z]|--[A-Za-z][A-Za-z-]*)(?:=\S+)?(?:\s+[^\s-]\S*)?\s+)*(pr\s+(merge|review)|release|workflow\s+run|api\b.*(-X|--method)\s*(POST|PUT|PATCH|DELETE))/, why: "Merging, approving, releasing and write-API calls are human authority." },
@@ -480,8 +902,26 @@ try {
     // through it. Check both the literal command and this one-hop resolution so
     // the existing regexes see the effective command, not just the written one.
     const cmdResolved = resolveSimpleVarIndirection(cmd);
+    // Push is analysed by a quote-aware tokeniser (deny-by-default), not the regex list.
+    for (const c of [cmd, cmdResolved]) {
+      const pv = gitPushDecision(c, context);
+      if (pv) return pv;
+    }
+    // Neutralise quoted argument VALUES (keeping empty quotes as a token boundary) so a
+    // global option carrying spaces — e.g. `git -c x='a b' push` — cannot push the
+    // forbidden verb out of reach of the flag-skipping regexes. Detection only; this
+    // never grants anything, it only makes the existing denials harder to evade.
+    const stripQuoted = (s) => s.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
+    // Tokens-rejoined variant: tokenization strips quotes, so a quote-split verb
+    // (`git reb"ase"`) or binary (`g"it" push`) reads as its real word here. Over-denial
+    // (a rule word appearing in quoted prose) is the safe direction for this list.
+    const rejoin = (s) => tokenizeShell(s).join(" ");
+    // deBackslash: the shell drops an unquoted `\`, so `--am\end` runs as `--amend`.
+    // Include a backslash-stripped variant so that trick can't slip any rule below.
+    const deBackslash = (s) => String(s).replace(/\\/g, "");
+    const variants = [cmd, cmdResolved, stripQuoted(cmd), stripQuoted(cmdResolved), rejoin(cmd), rejoin(cmdResolved), deBackslash(cmd), deBackslash(rejoin(cmd))];
     for (const { re, why } of FORBIDDEN_COMMANDS) {
-      if (re.test(cmd) || re.test(cmdResolved)) {
+      if (variants.some((v) => re.test(v))) {
         return decide("deny", "forbidden-effect", `${why}\nCommand: ${cmd.slice(0, 400)}`, context);
       }
     }
@@ -557,6 +997,12 @@ try {
 
   const rel = relativize(rawTarget);
   if (rel === null) {
+    // Plan-mode/todo scratch under ~/.claude/plans|todos is the harness's own bookkeeping,
+    // not repo content — allow it so plan mode works in an Atlas repo. Everything else
+    // outside the repository (including the rest of ~/.claude/) stays denied.
+    if (isHarnessScratch(rawTarget)) {
+      return decide("allow", "harness-scratch", rawTarget, context);
+    }
     return decide("deny", "outside-repository", `Path resolves outside the repository: ${rawTarget}`, context);
   }
 
