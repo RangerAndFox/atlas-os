@@ -12,15 +12,29 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
+permissions:
+  contents: read
+  pull-requests: read
+
 concurrency:
   group: atlas-design-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  design-review:
+  design_evidence:
     runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.cfg.outputs.enabled }}
+      user_facing: ${{ steps.scope.outputs.userFacing }}
+      harness_exit: ${{ steps.harness.outputs.exit || steps.cap.outputs.exit }}
+      ready_ok: ${{ steps.harness.outputs.readyOk || steps.cap.outputs.readyOk }}
+      captured: ${{ steps.shots.outputs.captured || steps.cap.outputs.captured }}
+      declared: ${{ steps.shots.outputs.declared || steps.cap.outputs.declared }}
+      function_exit: ${{ steps.fn.outputs.exit }}
+      override_present: ${{ steps.override.outputs.present }}
+      override_owner: ${{ steps.override.outputs.owner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -33,10 +47,10 @@ jobs:
         run: |
           set -euo pipefail
           present=false; owner=false
-          if ${{ contains(github.event.pull_request.labels.*.name, 'atlas-override-design') }}; then
+          if [ "${{ github.event.action }}" = "labeled" ] \
+             && [ "${{ github.event.label.name }}" = "atlas-override-design" ]; then
             present=true
-            if [ "${{ github.event.sender.login }}" = "${{ vars.ATLAS_OWNER }}" ] \
-               || [ "${{ github.actor }}" = "${{ vars.ATLAS_OWNER }}" ]; then owner=true; fi
+            if [ "${{ github.event.sender.login }}" = "${{ vars.ATLAS_OWNER }}" ]; then owner=true; fi
           fi
           echo "present=$present" >> "$GITHUB_OUTPUT"
           echo "owner=$owner"     >> "$GITHUB_OUTPUT"
@@ -97,7 +111,7 @@ jobs:
           PATHS_B64: ${{ steps.cfg.outputs.paths_b64 }}
 
       # ---- Everything below only matters when enabled AND user-facing ------
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
         with:
           node-version: ${{ steps.cfg.outputs.node }}
@@ -186,9 +200,30 @@ jobs:
           VIEWPORTS_B64: ${{ steps.cfg.outputs.viewports_b64 }}
           READY_URL: ${{ steps.cfg.outputs.readyUrl }}
 
+      - name: Validate exact declared screenshot set
+        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
+        env:
+          SCREENS_B64: ${{ steps.cfg.outputs.screens_b64 }}
+          VIEWPORTS_B64: ${{ steps.cfg.outputs.viewports_b64 }}
+        run: |
+          node --input-type=module <<'EOF'
+          import fs from 'node:fs';
+          const decode = (value) => JSON.parse(Buffer.from(value, 'base64').toString('utf8'));
+          const screens = decode(process.env.SCREENS_B64);
+          const viewports = decode(process.env.VIEWPORTS_B64);
+          const expected = screens.flatMap((screen) => viewports.map((viewport) => `${screen.name}-${viewport}.png`));
+          const actual = new Set(fs.existsSync('artifacts/design') ? fs.readdirSync('artifacts/design') : []);
+          const missing = expected.filter((name) => !actual.has(name));
+          if (missing.length > 0) {
+            console.error(`::error::Missing declared screenshots: ${missing.join(', ')}`);
+            process.exit(1);
+          }
+          console.log(`Validated ${expected.length} declared screenshot identities.`);
+          EOF
+
       - name: Upload screenshots (evidence)
         if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: atlas-design-screenshots-${{ github.event.pull_request.number }}
           path: artifacts/design/
@@ -201,16 +236,32 @@ jobs:
           bash -lc "${{ steps.cfg.outputs.functionSignal }}"
           echo "exit=$?" >> "$GITHUB_OUTPUT"
 
-      # ---- The design-director reviews the captured pixels -----------------
+  design_director:
+    needs: design_evidence
+    if: needs.design_evidence.outputs.enabled == 'true' && needs.design_evidence.outputs.user_facing == 'true' && needs.design_evidence.outputs.override_owner != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write
+    outputs:
+      verdict: ${{ steps.review.outputs.structured_output && fromJSON(steps.review.outputs.structured_output).verdict }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: atlas-design-screenshots-${{ github.event.pull_request.number }}
+          path: artifacts/design/
       - name: Design-director review
         id: review
-        if: steps.cfg.outputs.enabled == 'true' && steps.scope.outputs.userFacing == 'true' && steps.override.outputs.owner != 'true'
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@d07835ac7037978eb1aa67c6be18ed0883cea652 # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: |
             --model ${{ vars.ATLAS_REVIEWER_MODEL || 'claude-opus-4-8' }}
-            --allowedTools 'Bash,Read,Grep,Glob'
+            --allowedTools 'Read,Grep,Glob'
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["GO","NO-GO"]},"findings":{"type":"array","items":{"type":"object","properties":{"screen":{"type":"string"},"viewport":{"type":"string"},"severity":{"type":"string"},"what":{"type":"string"},"why_it_matters":{"type":"string"}}}},"most_important":{"type":"string"},"unverified":{"type":"string"}},"required":["verdict","most_important"]}'
           prompt: |
             You are the Atlas design-director running in CI. You did NOT build this change.
@@ -222,18 +273,28 @@ jobs:
             actual pixels — legibility, hierarchy, layout integrity (especially mobile),
             state honesty, consistency, and obvious accessibility misses.
 
-            The repo's own end-to-end run exited with code ${{ steps.fn.outputs.exit || 'n/a' }}.
-            The UI harness readiness was ${{ steps.harness.outputs.readyOk || steps.cap.outputs.readyOk || 'unknown' }}.
+            The repo's own end-to-end run exited with code ${{ needs.design_evidence.outputs.function_exit || 'n/a' }}.
+            The UI harness readiness was ${{ needs.design_evidence.outputs.ready_ok || 'unknown' }}.
 
             Hard rules: if a declared screen has no screenshot, do NOT approve it — that is a
             NO-GO. Do not narrate a screen you cannot see. Return the structured verdict.
 
-      # ---- The gate: tested logic turns the verdict into a decision --------
+  design-review:
+    needs: [design_evidence, design_director]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
       - name: Design gate
         id: gate
-        if: always() && steps.cfg.outputs.enabled == 'true'
         run: |
           set -euo pipefail
+          if [ "$EVIDENCE_RESULT" != "success" ]; then
+            echo "::error::Design evidence job did not complete successfully."
+            exit 1
+          fi
           node --input-type=module <<'EOF'
           import { evaluateDesignGate } from "./plugin/atlas/design/gate.mjs";
           const num = (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d; };
@@ -255,16 +316,17 @@ jobs:
           if (!g.pass) console.log(`::notice::Not a design pass (${g.status}); not recorded as green.`);
           EOF
         env:
-          ENABLED: ${{ steps.cfg.outputs.enabled }}
-          USER_FACING: ${{ steps.scope.outputs.userFacing }}
+          EVIDENCE_RESULT: ${{ needs.design_evidence.result }}
+          ENABLED: ${{ needs.design_evidence.outputs.enabled }}
+          USER_FACING: ${{ needs.design_evidence.outputs.user_facing }}
           # Whichever capture mode ran wrote these; the other step was skipped and its
           # outputs are empty. GitHub treats "0"/"false" as non-empty (truthy) strings, so
           # `||` preserves the real value from the step that actually ran.
-          HARNESS_EXIT: ${{ steps.harness.outputs.exit || steps.cap.outputs.exit }}
-          READY_OK: ${{ steps.harness.outputs.readyOk || steps.cap.outputs.readyOk }}
-          CAPTURED: ${{ steps.shots.outputs.captured || steps.cap.outputs.captured }}
-          DECLARED: ${{ steps.shots.outputs.declared || steps.cap.outputs.declared }}
-          FN_EXIT: ${{ steps.fn.outputs.exit }}
-          VERDICT: ${{ steps.review.outputs.structured_output && fromJSON(steps.review.outputs.structured_output).verdict }}
-          OVR_PRESENT: ${{ steps.override.outputs.present }}
-          OVR_OWNER: ${{ steps.override.outputs.owner }}
+          HARNESS_EXIT: ${{ needs.design_evidence.outputs.harness_exit }}
+          READY_OK: ${{ needs.design_evidence.outputs.ready_ok }}
+          CAPTURED: ${{ needs.design_evidence.outputs.captured }}
+          DECLARED: ${{ needs.design_evidence.outputs.declared }}
+          FN_EXIT: ${{ needs.design_evidence.outputs.function_exit }}
+          VERDICT: ${{ needs.design_director.outputs.verdict }}
+          OVR_PRESENT: ${{ needs.design_evidence.outputs.override_present }}
+          OVR_OWNER: ${{ needs.design_evidence.outputs.override_owner }}
