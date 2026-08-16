@@ -7,11 +7,8 @@
 #
 # Verdict capture is DETERMINISTIC. The reviewer's result is forced into a JSON
 # schema (--json-schema) and surfaced as the action's `structured_output`. The
-# workflow — not the model — then posts the human-readable comment and gates the
-# merge on `verdict == GO`. An earlier design asked the model to write a file or
-# post a comment itself; the model's file never reached the runner and no comment
-# was posted, so the gate correctly failed closed but nothing was captured. Reading
-# the action's own structured output removes that whole class of flakiness.
+# workflow gates deterministically on `verdict == GO`. It deliberately does not
+# grant PR-write permission to the secret-bearing reviewer job.
 #
 # Risk-class routing is done by CODEOWNERS, not here: a guarded-path PR also needs
 # the owner's review (one tap); an ordinary-code PR needs only this check green.
@@ -19,26 +16,75 @@ name: atlas-independent-review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
-# Least privilege: read the code, write a PR comment, mint an OIDC token for the
-# action's auth handshake. Nothing else.
+# Least privilege: the secret-bearing reviewer cannot write to the pull request.
 permissions:
   contents: read
-  pull-requests: write
-  id-token: write
+  pull-requests: read
 
 concurrency:
   group: atlas-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  independent-review:
+  review_context:
     runs-on: ubuntu-latest
+    outputs:
+      validation_exit: ${{ steps.validation.outputs.exit }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      - name: Capture untrusted PR diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git diff --binary "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/pr.diff"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Run validation in no-secret job
+        id: validation
+        run: |
+          set +e
+          {
+            npm ci &&
+            node --input-type=module <<'EOF'
+          import { readFileSync } from 'node:fs';
+          import { execSync } from 'node:child_process';
+          const ladder = JSON.parse(readFileSync('.atlas/project.json', 'utf8')).validation?.ladder ?? [];
+          if (ladder.length === 0) process.exit(1);
+          for (const rung of ladder) execSync(rung.command, { stdio: 'inherit' });
+          EOF
+          } > "$RUNNER_TEMP/validation.log" 2>&1
+          code=$?
+          cat "$RUNNER_TEMP/validation.log"
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: atlas-review-context-${{ github.event.pull_request.number }}
+          path: |
+            ${{ runner.temp }}/pr.diff
+            ${{ runner.temp }}/validation.log
+
+  independent-review:
+    needs: review_context
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: atlas-review-context-${{ github.event.pull_request.number }}
+          path: artifacts/review/
 
       # ---- Owner override --------------------------------------------------
       # "Block, but I can override." A NO-GO blocks. The owner — and ONLY the
@@ -48,11 +94,10 @@ jobs:
       # bypasses THIS check only; code-owner review on guarded paths still stands.
       - name: Honor owner override
         id: override
-        if: contains(github.event.pull_request.labels.*.name, 'atlas-override-review')
+        if: github.event.action == 'labeled' && github.event.label.name == 'atlas-override-review'
         run: |
           set -euo pipefail
-          if [ "${{ github.event.sender.login }}" = "${{ vars.ATLAS_OWNER }}" ] \
-             || [ "${{ github.actor }}" = "${{ vars.ATLAS_OWNER }}" ]; then
+          if [ "${{ github.event.sender.login }}" = "${{ vars.ATLAS_OWNER }}" ]; then
             echo "overridden=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Independent review OVERRIDDEN by owner ${{ vars.ATLAS_OWNER }} via atlas-override-review label."
           else
@@ -63,7 +108,7 @@ jobs:
       - name: Independent adversarial review
         id: review
         if: steps.override.outputs.overridden != 'true'
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@d07835ac7037978eb1aa67c6be18ed0883cea652 # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # Reviewer model deliberately settable; prefer a different model than the
@@ -71,7 +116,7 @@ jobs:
           # --json-schema forces the verdict into structured_output (see gate step).
           claude_args: |
             --model ${{ vars.ATLAS_REVIEWER_MODEL || 'claude-opus-4-8' }}
-            --allowedTools 'Bash,Read,Grep,Glob'
+            --allowedTools 'Read,Grep,Glob'
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["GO","NO-GO"]},"summary":{"type":"string"},"most_important":{"type":"string"},"blast_radius":{"type":"string"},"unverified":{"type":"string"}},"required":["verdict","summary"]}'
           prompt: |
             You are the Atlas independent reviewer running in CI. You did NOT write
@@ -80,11 +125,9 @@ jobs:
             base ${{ github.event.pull_request.base.sha }} -> head ${{ github.event.pull_request.head.sha }}.
 
             You MUST:
-            1. Read the full diff.
-            2. RUN the repository's own validation — do not trust it. Use the steps in
-               .atlas/project.json's validation ladder if present, else the repo's
-               `test` / `release:check` scripts, and for atlas-os itself
-               `bash plugin/atlas/hooks/atlas-guard.test.sh`. Report the real result.
+            1. Read the full untrusted PR diff at artifacts/review/pr.diff.
+            2. Read artifacts/review/validation.log, produced by a separate no-secret
+               execution job. Do not execute PR-controlled code here.
             3. Confirm the tests exercise the real mechanism, not a harness that
                bypasses it. If they self-fool, that is a NO-GO reason on its own.
             4. Try to falsify the change with concrete inputs.
@@ -95,47 +138,19 @@ jobs:
                - blast_radius: what breaks if this is wrong, and whether it is reversible
                - unverified: one thing you could not verify
             Do NOT try to write a file or post a comment yourself — the workflow reads
-            your structured output and posts the comment.
-
-      # Deterministic: the WORKFLOW posts the verdict comment from structured_output,
-      # so the human always sees a plain-language GO/NO-GO regardless of what tools
-      # the model chose to use.
-      - name: Post verdict comment
-        if: steps.override.outputs.overridden != 'true'
-        continue-on-error: true   # a transient comment-post failure must not fail a genuine GO; the gate still enforces the verdict
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SO: ${{ steps.review.outputs.structured_output }}
-        run: |
-          set -euo pipefail
-          if [ -z "${SO:-}" ]; then
-            echo "::warning::Reviewer produced no structured output; nothing to comment (the gate will fail closed)."
-            exit 0
-          fi
-          verdict=$(printf '%s' "$SO" | jq -r '.verdict // "NO-GO"')
-          summary=$(printf '%s' "$SO" | jq -r '.summary // ""')
-          most=$(printf '%s' "$SO" | jq -r '.most_important // ""')
-          blast=$(printf '%s' "$SO" | jq -r '.blast_radius // ""')
-          unver=$(printf '%s' "$SO" | jq -r '.unverified // ""')
-          {
-            echo "ATLAS REVIEW: $verdict"
-            echo ""
-            echo "$summary"
-            echo ""
-            echo "- **Most important:** $most"
-            echo "- **Blast radius:** $blast"
-            echo "- **Couldn't verify:** $unver"
-            echo ""
-            echo "_Posted by the Atlas independent reviewer (informs, never merges). Owner override: add the \`atlas-override-review\` label._"
-          } > "$RUNNER_TEMP/atlas-comment.md"
-          gh pr comment "${{ github.event.pull_request.number }}" --body-file "$RUNNER_TEMP/atlas-comment.md"
+            your structured output and gates on it directly.
 
       - name: Gate on the verdict
         if: steps.override.outputs.overridden != 'true'
         env:
           SO: ${{ steps.review.outputs.structured_output }}
+          VALIDATION_EXIT: ${{ needs.review_context.outputs.validation_exit }}
         run: |
           set -euo pipefail
+          if [ "$VALIDATION_EXIT" != "0" ]; then
+            echo "::error::Independent validation failed in the no-secret job."
+            exit 1
+          fi
           if [ -z "${SO:-}" ]; then
             echo "::error::Reviewer produced no structured output. Failing closed — absence of a review is not a pass."
             exit 1

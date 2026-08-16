@@ -61,6 +61,8 @@ That last row is the honest limit. Role discipline is prompt-level: a subagent a
 ## Known gaps
 
 - **Role attribution in the hook payload is best-effort.** Claude Code does not guarantee an agent identifier to `PreToolUse`. The guard therefore treats an unknown role as the *least* privileged, so a missing field can never grant access — but verify attribution works in your version before relying on the acceptance-test rule as your only barrier. `hooks/atlas-guard.test.sh` covers the unknown-role case.
-- **The guard fails open on its own bugs** (`ATLAS_GUARD_FAIL_CLOSED=1` inverts this). Policy denials are hard; a crash in the guard is not. Once you trust it in your environment, set the variable.
+- **The guard fails closed on its own bugs.** Policy denials and guard crashes both
+  block by default. `ATLAS_GUARD_FAIL_OPEN=1` is an explicit diagnostic escape hatch;
+  never enable it in a governed agent session.
 - **MCP servers and hooks run outside the built-in Bash sandbox.** If you add MCP servers, they are not constrained by the sandbox ladder.
 - **A Routine or scheduled cloud run has no approval prompts by design.** That is exactly why the gate is a merge and not a prompt. Keep scheduled runs pushing to a `claude/*` branch and let the ruleset hold the line.
